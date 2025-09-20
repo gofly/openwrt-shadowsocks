@@ -1,0 +1,26 @@
+config servers main
+	option server '12.34.56.78'
+	option server_port '1234'
+	option encrypt_method 'chacha20-ietf-poly1305'
+	option password 'pass'
+	option plugin ''
+	option plugin_opts ''
+	option mtu '1200'
+	option timeout '60'
+	option fast_open '1'
+	option no_delay '1'
+	option fwmark '255'
+
+config redir
+	option main_server main
+
+config rules
+	option local_port '65535'
+	option wan_fw4_list '/usr/share/shadowsocks/wan_fw4_list.txt'
+	option wan_fw6_list '/usr/share/shadowsocks/wan_fw6_list.txt'
+	option wan_bp4_list '/usr/share/shadowsocks/wan_bp4_list.txt'
+	option wan_bp6_list '/usr/share/shadowsocks/wan_bp6_list.txt'
+	list lan_ifaces 'br-lan'
+	list wan_fw_ports '80'
+	list wan_fw_ports '443'
+	list lan_fw_mac '00:00:00:00:00:00'

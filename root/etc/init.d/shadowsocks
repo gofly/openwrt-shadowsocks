@@ -1,0 +1,137 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=15
+
+USE_PROCD=1
+
+PROG=/usr/bin/ss-redir
+
+NAME="shadowsocks"
+
+. /usr/share/libubox/jshn.sh
+
+uci_get_by_name() {
+	local ret=$(uci get $NAME.$1.$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+uci_get_by_type() {
+	local ret=$(uci get $NAME.@$1[0].$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+uci_bool_by_name() {
+	case "$(uci_get_by_name $1 $2)" in
+		1|on|true|yes|enabled) return 0;;
+	esac
+	return 1
+}
+
+validate_server() {
+	[ "$(uci get $NAME.$1 2>/dev/null)" = "servers" ]
+}
+
+get_arg_tfo() {
+	uci_bool_by_name $1 fast_open && echo "--fast-open"
+}
+
+get_arg_tnd() {
+	uci_bool_by_name $1 no_delay && echo "--no-delay"
+}
+
+gen_config_file() {
+	local config_file=/var/etc/$NAME.$1.json
+	json_init
+	json_add_string "local_port" "$(uci_get_by_type rules local_port 65535)"
+	json_add_string "server" "$(uci_get_by_name $1 server)"
+	json_add_int "server_port" $(uci_get_by_name $1 server_port)
+	json_add_string "method" "$(uci_get_by_name $1 encrypt_method)"
+	json_add_int "timeout" $(uci_get_by_name $1 timeout 60)
+	json_add_int "fwmark" $(uci_get_by_name $1 fwmark 255)
+	json_add_int "mtu" $(uci_get_by_name $1 mtu 1492)
+	
+	local key=$(uci_get_by_name $1 key)
+	local password=$(uci_get_by_name $1 password)
+	if [ -n "$key" ]; then
+		json_add_string "key" "$key"
+	elif [ -n "$password" ]; then
+		json_add_string "password" "$password"
+	fi
+	local plugin=$(uci_get_by_name $1 plugin)
+	local plugin_opts=$(uci_get_by_name $1 plugin_opts)
+	if [ -n "$plugin" ]; then
+		echo $plugin >>/var/run/ss-plugin
+		json_add_string "plugin" "$plugin"
+		if [ -n "$plugin_opts" ]; then
+			json_add_string "plugin_opts" "$plugin_opts"
+		fi
+	fi
+
+	json_add_boolean "fast_open" $(uci_bool_by_name $1 fast_open)
+	json_add_boolean "no_delay" $(uci_bool_by_name $1 no_delay)
+
+	json_add_boolean "reuse_port" 1
+	json_add_string "mode" "tcp_and_udp"
+	json_add_boolean "tcp_tproxy" 1
+	json_close_object
+	json_dump -i >$config_file
+	echo $config_file
+}
+
+start_redir() {
+	validate_server $1 || return 0
+	command -v ss-redir >/dev/null || return 1
+	procd_open_instance
+	procd_set_param command $PROG -c $(gen_config_file $1) -b $2
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 1200 5 10
+	procd_set_param limits nofile="100000 100000"
+	procd_append_param limits core="0 0"
+	procd_close_instance
+}
+
+start_rules() {
+	local local_port=$(uci_get_by_type rules local_port 65535)
+	local wan_fw4_list=$(uci_get_by_type rules wan_fw4_list)
+	local wan_fw6_list=$(uci_get_by_type rules wan_fw6_list)
+	local wan_bp4_list=$(uci_get_by_type rules wan_bp4_list)
+	local wan_bp6_list=$(uci_get_by_type rules wan_bp6_list)
+	local wan_fw_ports=$(uci_get_by_type rules wan_fw_ports)
+	local lan_fw_mac=$(uci_get_by_type rules lan_fw_mac)
+	local lan_ifaces=$(uci_get_by_type rules lan_ifaces)
+
+	/usr/bin/ss-rules \
+		-l "$local_port" \
+		-w "$wan_fw4_list" \
+		-W "$wan_fw6_list" \
+		-b "$wan_bp4_list" \
+		-B "$wan_bp6_list" \
+		-p "$wan_fw_ports" \
+		-m "$lan_fw_mac" \
+		-i "$lan_ifaces" || \
+	/usr/bin/ss-rules -f
+}
+
+flush_rules() {
+	/usr/bin/ss-rules -f
+}
+
+start_service() {
+	config_load $NAME
+	local main_server=$(uci_get_by_type redir main_server)
+	start_redir $main_server 127.0.0.1
+	start_redir $main_server ::1
+	start_rules
+}
+
+stop_service() {
+	flush_rules
+}
+
+reload_service() {
+	config_load $NAME
+	flush_rules
+	start_rules
+}
