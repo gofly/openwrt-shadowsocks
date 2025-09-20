@@ -1,0 +1,192 @@
+#!/bin/sh
+usage() {
+	cat <<-EOF
+		Usage: ss-rules [options]
+		Valid options are:
+			-l <local_port>         port number of shadowsocks server
+			-w <ipv4_list_file>     the file containing the target IPv4 addresses for forwarding.
+			-W <ipv6_list_file>     the file containing the target IPv4 addresses for forwarding.
+			-b <ipv4_list_file>     the file containing the target IPv4 addresses for bypass.
+			-B <ipv6_list_file>     the file containing the target IPv6 addresses for bypass.
+			-p <wan_forward_ports>  port numbers of wan forwarded
+			-m <mac_list>           source mac list of wan forwarded
+			-i <interface>          proxy only for the given interface
+			-f                      flush the rules
+			-h                      show this help message and exit
+EOF
+	exit $1
+}
+
+loger() {
+	# 1.alert 2.crit 3.err 4.warn 5.notice 6.info 7.debug
+	logger -st ss-rules[$$] -p$1 $2
+}
+
+flush_rules() {
+	nft delete table inet ss 2>/dev/null
+
+	while ip rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
+
+	while ip -6 rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip -6 route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
+}
+
+apply_rules(){
+	nft -f - <<-EOF
+	table inet ss {
+		set dst_ipv4_forward {
+			type ipv4_addr
+			flags interval
+			auto-merge
+			$([ -f "$WAN_FW4_LIST_PATH" ] && {
+				local wan_fw4_list="$(cat $WAN_FW4_LIST_PATH | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')"
+				[ -z "$wan_fw4_list" ] || {
+					echo "elements = {$wan_fw4_list}"
+				}
+			})
+		}
+		set dst_ipv6_forward {
+			type ipv6_addr
+			flags interval
+			auto-merge
+			$([ -f "$WAN_FW6_LIST_PATH" ] && {
+				local wan_fw6_list="$(cat $WAN_FW6_LIST_PATH | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')"
+				[ -z "$wan_fw6_list" ] || {
+					echo "elements = {$wan_fw6_list}"
+				}
+			})
+		}
+		set dst_ipv4_bypass {
+			type ipv4_addr
+			flags interval
+			auto-merge
+			elements = {
+				127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.0.0.0/24,192.88.99.0/24,192.168.0.0/16,198.51.100.0/24, \
+				169.254.0.0/16,192.0.2.0/24,203.0.113.0/24,224.0.0.0/4,233.252.0.0/24,255.255.255.255/32, \
+				$([ -f "$WAN_BP4_LIST_PATH" ] && {
+					local wan_bp4_list="$(cat $WAN_BP4_LIST_PATH | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')"
+					[ -z "$wan_bp4_list" ] || {
+						echo ",$wan_bp4_list"
+					}
+				})
+			}
+		}
+
+		set dst_ipv6_bypass {
+			type ipv6_addr
+			flags interval
+			auto-merge
+			elements = {
+				::/128,::1/128,fc00::/7,fe80::/10,ff00::/8, \
+				$([ -f "$WAN_BP6_LIST_PATH" ] && {
+					local wan_bp6_list="$(cat $WAN_BP6_LIST_PATH | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')"
+					[ -z "$wan_bp6_list" ] || {
+						echo ",$wan_bp6_list"
+					}
+				})
+			}
+		}
+
+		set fw_allowed_src_mac {
+			type ether_addr
+			$([ -n "$LAN_FW_LIST" ] && echo "elements = {$(echo $LAN_FW_LIST | sed 's/ /,/g')}")
+		}
+
+		chain divert {
+			type filter hook prerouting priority -150; policy accept;
+			meta l4proto tcp socket transparent 1 meta mark set 0x0e accept
+		}
+
+		chain tproxy_mark {
+			meta mark != 0x0e meta l4proto { tcp, udp } meta mark set 0x0e
+		}
+
+		chain mangle_output {
+			type route hook output priority filter + 1; policy accept;
+			fib daddr type { unspec, local, anycast, multicast } return
+			meta mark == 0xff return
+			udp dport 123 return
+			udp dport 53 oifname != "lo" goto tproxy_mark
+			ip  daddr @dst_ipv4_forward goto tproxy_mark
+			ip6 daddr @dst_ipv6_forward goto tproxy_mark
+			ip  daddr @dst_ipv4_bypass return
+			ip6 daddr @dst_ipv6_bypass return
+			meta l4proto { tcp, udp } goto tproxy_mark
+		}
+
+		chain ss_tproxy {
+			#meta mark != 0x0e meta l4proto { tcp, udp } meta mark set 0x0e
+			meta protocol ip  meta l4proto { tcp, udp } tproxy ip  to 127.0.0.1:$LOCAL_PORT
+			meta protocol ip6 meta l4proto { tcp, udp } tproxy ip6 to [::1]:$LOCAL_PORT
+		}
+
+		chain mangle_prerouting {
+			type filter hook prerouting priority filter + 1; policy accept;
+			meta mark == 0x0e goto ss_tproxy
+			$([ -n "$IFNAMES" ] && echo "iifname != {$(echo $IFNAMES | sed 's/ /,/g')} return")
+			$([ -n "$LAN_FW_LIST" ] && echo "ether saddr != @fw_allowed_src_mac return")
+			$([ -n "$WAN_FW_PORTS" ] && echo "tcp dport != {$(echo $WAN_FW_PORTS | sed 's/ /,/g')} return")
+			ip  daddr @dst_ipv4_forward jump tproxy_mark
+			ip6 daddr @dst_ipv6_forward jump tproxy_mark
+			meta mark == 0x0e goto ss_tproxy
+			ip  daddr @dst_ipv4_bypass return
+			ip6 daddr @dst_ipv6_bypass return
+			fib daddr type { unspec, local, anycast, multicast } return
+			jump tproxy_mark
+			meta l4proto { tcp, udp } goto ss_tproxy
+		}
+	}
+EOF
+
+}
+
+init_route(){
+	ip rule add fwmark 0x0e/0x0f lookup 100
+	ip route add local default dev lo table 100
+	ip -6 rule add fwmark 0x0e/0x0f lookup 100
+	ip -6 route add local default dev lo table 100
+}
+
+
+while getopts ":l:w:W:b:B:p:r:m:i:fh" arg; do
+	case "$arg" in
+		l)
+			LOCAL_PORT=${OPTARG:-65535}
+			;;
+		w)
+			WAN_FW4_LIST_PATH=$OPTARG
+			;;
+		W)
+			WAN_FW6_LIST_PATH=$OPTARG
+			;;
+		b)
+			WAN_BP4_LIST_PATH=$OPTARG
+			;;
+		B)
+			WAN_BP6_LIST_PATH=$OPTARG
+			;;
+		p)
+			WAN_FW_PORTS=$OPTARG
+			;;
+		m)
+			LAN_FW_LIST=$OPTARG
+			;;
+		i)
+			IFNAMES=$OPTARG
+			;;
+		f)
+			flush_rules
+			exit 0
+			;;
+		h)
+			usage 0
+			;;
+	esac
+done
+
+[ -z "$LOCAL_PORT" ] && usage 2
+(flush_rules && apply_rules && init_route) || flush_rules
+RET=$?
+[ "$RET" = 0 ] || loger 3 "Start failed!"
+exit $RET
