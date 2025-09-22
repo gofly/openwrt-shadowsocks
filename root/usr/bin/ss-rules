@@ -107,7 +107,6 @@ apply_rules(){
 			fib daddr type { unspec, local, anycast, multicast } return
 			meta mark == 0xff counter return
 			udp dport 123 return
-			udp dport 53 oifname != "lo" goto tproxy_mark
 			ip  daddr @dst_ipv4_forward goto tproxy_mark
 			ip6 daddr @dst_ipv6_forward goto tproxy_mark
 			ip  daddr @dst_ipv4_bypass return
