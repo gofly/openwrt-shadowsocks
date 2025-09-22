@@ -25,10 +25,10 @@ loger() {
 flush_rules() {
 	nft delete table inet ss 2>/dev/null
 
-	while ip rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip rule del from all fwmark 0x0e/0xff lookup 100 2>/dev/null; do echo >/dev/null; done
 	while ip route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
 
-	while ip -6 rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip -6 rule del from all fwmark 0x0e/0xff lookup 100 2>/dev/null; do echo >/dev/null; done
 	while ip -6 route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
 }
 
@@ -63,7 +63,7 @@ apply_rules(){
 			auto-merge
 			elements = {
 				127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.0.0.0/24,192.88.99.0/24,192.168.0.0/16,198.51.100.0/24, \
-				169.254.0.0/16,192.0.2.0/24,203.0.113.0/24,224.0.0.0/4,233.252.0.0/24,255.255.255.255/32, \
+				169.254.0.0/16,192.0.2.0/24,203.0.113.0/24,224.0.0.0/4,233.252.0.0/24,255.255.255.255, \
 				$([ -f "$WAN_BP4_LIST_PATH" ] && {
 					local wan_bp4_list="$(cat $WAN_BP4_LIST_PATH | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')"
 					[ -z "$wan_bp4_list" ] || {
@@ -94,20 +94,20 @@ apply_rules(){
 		}
 
 		chain divert {
-			type filter hook prerouting priority -150; policy accept;
+			type filter hook prerouting priority mangle; policy accept;
 			meta l4proto tcp socket transparent 1 meta mark set 0x0e accept
 		}
 
 		chain tproxy_mark {
-			meta mark != 0x0e meta l4proto { tcp, udp } meta mark set 0x0e
+			meta mark & 0xff != 0x0e meta l4proto { tcp, udp } meta mark set 0x0e return
 		}
 
 		chain mangle_output {
-			type route hook output priority filter + 1; policy accept;
+			type route hook output priority mangle; policy accept;
 			fib daddr type { unspec, local, anycast, multicast } return
-			meta mark == 0xff counter return
+			meta mark 0xff return
 			udp dport 123 return
-			udp dport 53 oifname != "lo" goto tproxy_mark
+			udp dport 53 goto tproxy_mark
 			ip  daddr @dst_ipv4_forward goto tproxy_mark
 			ip6 daddr @dst_ipv6_forward goto tproxy_mark
 			ip  daddr @dst_ipv4_bypass return
@@ -121,17 +121,17 @@ apply_rules(){
 		}
 
 		chain mangle_prerouting {
-			type filter hook prerouting priority filter + 1; policy accept;
-			meta mark == 0x0e goto ss_tproxy
+			type filter hook prerouting priority mangle; policy accept;
+			fib daddr type { unspec, local, anycast, multicast } return
+			meta mark & 0xff == 0x0e goto ss_tproxy
 			$([ -n "$IFNAMES" ] && echo "iifname != {$(echo $IFNAMES | sed 's/ /,/g')} return")
 			$([ -n "$LAN_FW_LIST" ] && echo "ether saddr != @fw_allowed_src_mac return")
 			$([ -n "$WAN_FW_PORTS" ] && echo "tcp dport != {$(echo $WAN_FW_PORTS | sed 's/ /,/g')} return")
 			ip  daddr @dst_ipv4_forward jump tproxy_mark
 			ip6 daddr @dst_ipv6_forward jump tproxy_mark
-			meta mark == 0x0e goto ss_tproxy
+			meta mark & 0xff == 0x0e goto ss_tproxy
 			ip  daddr @dst_ipv4_bypass return
 			ip6 daddr @dst_ipv6_bypass return
-			fib daddr type { unspec, local, anycast, multicast } return
 			jump tproxy_mark
 			meta l4proto { tcp, udp } goto ss_tproxy
 		}
@@ -141,9 +141,9 @@ EOF
 }
 
 init_route(){
-	ip rule add fwmark 0x0e/0x0f lookup 100
+	ip rule add fwmark 0x0e/0xff lookup 100
 	ip route add local default dev lo table 100
-	ip -6 rule add fwmark 0x0e/0x0f lookup 100
+	ip -6 rule add fwmark 0x0e/0xff lookup 100
 	ip -6 route add local default dev lo table 100
 }
 

@@ -1,0 +1,924 @@
+From 0c1dd92a8737f8fd82ca0cab8473d75e0a97845d Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Wed, 24 Sep 2025 19:08:16 +0800
+Subject: [PATCH 5/6] add prometheus metrics exporter
+
+---
+ src/CMakeLists.txt |   1 +
+ src/Makefile.am    |   3 +-
+ src/common.h       |   1 +
+ src/jconf.c        |   7 +-
+ src/jconf.h        |   2 +-
+ src/metrics.c      | 468 +++++++++++++++++++++++++++++++++++++++++++++
+ src/metrics.h      |  55 ++++++
+ src/probe.c        |  15 +-
+ src/redir.c        |  34 +++-
+ src/udprelay.c     |  14 +-
+ src/utils.c        |   2 +
+ 11 files changed, 594 insertions(+), 8 deletions(-)
+ create mode 100644 src/metrics.c
+ create mode 100644 src/metrics.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index eb76252..bc331bb 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -26,6 +26,7 @@ set(SS_REDIR_SOURCE
+         ${SS_SHARED_SOURCES}
+         udprelay.c
+         probe.c
++        metrics.
+         cache.c
+         redir.c
+         ${SS_CRYPTO_SOURCE}
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 1d2a6e6..213a985 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -35,6 +35,7 @@ ss_redir_SOURCES = utils.c \
+                    cache.c \
+                    udprelay.c \
+                    probe.c \
++                   metrics.c \
+                    redir.c \
+                    $(crypto_src) \
+                    $(plugin_src)
+@@ -45,4 +46,4 @@ ss_redir_LDADD += -lcares
+ 
+ noinst_HEADERS = crypto.h stream.h aead.h json.h netutils.h redir.h uthash.h \
+                  cache.h plugin.h utils.h base64.h ppbloom.h \
+-                 common.h jconf.h udprelay.h probe.h
++                 common.h jconf.h udprelay.h probe.h metrics.h
+diff --git a/src/common.h b/src/common.h
+index 96d6d42..0adf02c 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -64,6 +64,7 @@ enum {
+     GETOPT_VAL_PROBE_UP_COUNT,
+     GETOPT_VAL_PROBE_DOWN_COUNT,
+     GETOPT_VAL_PROBE_DOMAIN,
++    GETOPT_VAL_METRICS_PORT,
+ };
+ 
+ #endif // _COMMON_H
+diff --git a/src/jconf.c b/src/jconf.c
+index 1d3a77b..c75a3ae 100644
+--- a/src/jconf.c
++++ b/src/jconf.c
+@@ -393,8 +393,11 @@ read_jconf(const char *file)
+                 conf.probe_domain = to_string(value);
+             } else if (strcmp(name, "acl") == 0) {
+                 conf.acl = to_string(value);
+-            } else if (strcmp(name, "manager_address") == 0) {
+-                conf.manager_address = to_string(value);
++            } else if (strcmp(name, "metrics_port") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'metrics_port' must be an integer");
++                conf.metrics_port = value->u.integer;
+             }
+         }
+     } else {
+diff --git a/src/jconf.h b/src/jconf.h
+index 57674d9..1c90253 100644
+--- a/src/jconf.h
++++ b/src/jconf.h
+@@ -88,13 +88,13 @@ typedef struct {
+     int tcp_tproxy;
+     char *workdir;
+     char *acl;
+-    char *manager_address;
+     int fwmark;
+     int probe_interval;
+     int probe_timeout;
+     int probe_up_count;
+     int probe_down_count;
+     char *probe_domain;
++    int metrics_port;
+ } jconf_t;
+ 
+ jconf_t *read_jconf(const char *file);
+diff --git a/src/metrics.c b/src/metrics.c
+new file mode 100644
+index 0000000..a0c0c61
+--- /dev/null
++++ b/src/metrics.c
+@@ -0,0 +1,468 @@
++/*
++ * metrics.c - Prometheus metrics exporter
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <pthread.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <errno.h>
++
++#include "metrics.h"
++#include "utils.h"
++
++static ev_io metrics_watcher;
++static int metrics_fd = -1;
++static pthread_mutex_t metrics_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Metrics data */
++static time_t process_start_time = 0;
++static long tcp_connections = 0;
++static long tcp_connections_total = 0;
++static long tcp_tx_bytes_total = 0;
++static long tcp_rx_bytes_total = 0;
++static size_t udp_sessions = 0;
++static long udp_sessions_total = 0;
++static long udp_tx_bytes_total = 0;
++static long udp_rx_bytes_total = 0;
++
++static int total_remotes = 0;
++static char **remote_addr_labels = NULL;
++static bool *remote_up = NULL;
++static int *remote_latency = NULL;
++static long *remote_probes_total = NULL;
++static long *remote_probe_failures_total = NULL;
++static long *remote_tcp_connections_total = NULL;
++static long *remote_tcp_connections = NULL;
++static long *remote_tcp_failures_total = NULL;
++static long *remote_udp_sessions = NULL;
++static long *remote_udp_sessions_total = NULL;
++static long *remote_udp_session_timeouts_total = NULL;
++
++static void
++metrics_accept_cb(EV_P_ ev_io *w, int revents)
++{
++    int client_fd = accept(w->fd, NULL, NULL);
++    if (client_fd == -1) {
++        return;
++    }
++
++    char req_buffer[1024];
++    ssize_t nread = recv(client_fd, req_buffer, sizeof(req_buffer) - 1, 0);
++
++    if (nread > 0) {
++        req_buffer[nread] = '\0';
++        if (strstr(req_buffer, "GET /metrics") != NULL) {
++            char res_buffer[4096];
++            char *pos = res_buffer;
++            char *end = res_buffer + sizeof(res_buffer);
++
++            pthread_mutex_lock(&metrics_lock);
++
++            pos += snprintf(pos, end - pos, "# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n");
++            pos += snprintf(pos, end - pos, "# TYPE process_start_time_seconds gauge\n");
++            pos += snprintf(pos, end - pos, "process_start_time_seconds %lld\n", (long long)process_start_time);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_tcp_connections Current number of TCP connections.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_tcp_connections gauge\n");
++            pos += snprintf(pos, end - pos, "ss_tcp_connections %ld\n", tcp_connections);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_tcp_connections_total Total number of TCP connections.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_tcp_connections_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_tcp_connections_total %ld\n", tcp_connections_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_udp_sessions Current number of UDP sessions.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_udp_sessions gauge\n");
++            pos += snprintf(pos, end - pos, "ss_udp_sessions %zu\n", udp_sessions);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_udp_sessions_total Total number of UDP sessions created.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_udp_sessions_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_udp_sessions_total %ld\n", udp_sessions_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_tcp_tx_bytes_total Total bytes sent from client to remote (TCP).\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_tcp_tx_bytes_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_tcp_tx_bytes_total %ld\n", tcp_tx_bytes_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_tcp_rx_bytes_total Total bytes received from remote to client (TCP).\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_tcp_rx_bytes_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_tcp_rx_bytes_total %ld\n", tcp_rx_bytes_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_udp_tx_bytes_total Total bytes sent from client to remote (UDP).\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_udp_tx_bytes_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_udp_tx_bytes_total %ld\n", udp_tx_bytes_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_udp_rx_bytes_total Total bytes received from remote to client (UDP).\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_udp_rx_bytes_total counter\n");
++            pos += snprintf(pos, end - pos, "ss_udp_rx_bytes_total %ld\n", udp_rx_bytes_total);
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_up Remote server availability (1=up, 0=down).\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_up gauge\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_up{remote=\"%s\"} %d\n", remote_addr_labels[i], remote_up[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_probe_latency_milli_seconds Latency of remote server probe.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_probe_latency_milli_seconds gauge\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_probe_latency_milli_seconds{remote=\"%s\"} %d\n", remote_addr_labels[i], remote_latency[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_probes_total Total number of probes sent to remote servers.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_probes_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_probes_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_probes_total[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_probe_failures_total Total number of failed probes for remote servers.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_probe_failures_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_probe_failures_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_probe_failures_total[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_tcp_connections Current number of TCP connections for each remote server.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_tcp_connections gauge\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_tcp_connections{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_tcp_connections[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_tcp_connections_total Total number of TCP connection attempts to remote servers.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_tcp_connections_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_tcp_connections_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_tcp_connections_total[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_tcp_failures_total Total number of failed TCP connection attempts to remote servers.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_tcp_failures_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_tcp_failures_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_tcp_failures_total[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_udp_sessions Current number of UDP sessions for each remote server.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_udp_sessions gauge\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_udp_sessions{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_udp_sessions[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_udp_sessions_total Total number of UDP sessions created for each remote server.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_udp_sessions_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_udp_sessions_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_udp_sessions_total[i]);
++                }
++            }
++
++            pos += snprintf(pos, end - pos, "# HELP ss_remote_server_udp_session_timeouts_total Total number of UDP sessions that timed out waiting for a reply from remote servers.\n");
++            pos += snprintf(pos, end - pos, "# TYPE ss_remote_server_udp_session_timeouts_total counter\n");
++            for (int i = 0; i < total_remotes; i++) {
++                if (remote_addr_labels[i]) {
++                    pos += snprintf(pos, end - pos, "ss_remote_server_udp_session_timeouts_total{remote=\"%s\"} %ld\n", remote_addr_labels[i], remote_udp_session_timeouts_total[i]);
++                }
++            }
++
++            pthread_mutex_unlock(&metrics_lock);
++
++            char http_response[8192];
++            int body_len = strlen(res_buffer);
++            int header_len = snprintf(http_response, sizeof(http_response),
++                                      "HTTP/1.1 200 OK\r\n"
++                                      "Content-Type: text/plain; version=0.0.4\r\n"
++                                      "Content-Length: %d\r\n"
++                                      "\r\n", body_len);
++
++            if (header_len + body_len < sizeof(http_response)) {
++                memcpy(http_response + header_len, res_buffer, body_len);
++                send(client_fd, http_response, header_len + body_len, 0);
++            }
++        }
++    }
++
++    close(client_fd);
++}
++
++void
++metrics_init(EV_P_ const char *addr, uint16_t port, int remote_num, time_t start_time)
++{
++    if (!addr || port == 0) {
++        return;
++    }
++
++    process_start_time = start_time;
++
++    total_remotes = remote_num;
++    remote_up = ss_malloc(sizeof(bool) * total_remotes);
++    remote_latency = ss_malloc(sizeof(int) * total_remotes);
++    remote_addr_labels = ss_malloc(sizeof(char*) * total_remotes);
++    remote_probes_total = ss_malloc(sizeof(long) * total_remotes);
++    remote_probe_failures_total = ss_malloc(sizeof(long) * total_remotes);
++    remote_tcp_connections = ss_malloc(sizeof(long) * total_remotes);
++    remote_tcp_connections_total = ss_malloc(sizeof(long) * total_remotes);
++    remote_tcp_failures_total = ss_malloc(sizeof(long) * total_remotes);
++    remote_udp_sessions = ss_malloc(sizeof(long) * total_remotes);
++    remote_udp_sessions_total = ss_malloc(sizeof(long) * total_remotes);
++    remote_udp_session_timeouts_total = ss_malloc(sizeof(long) * total_remotes);
++
++    for (int i = 0; i < total_remotes; i++) {
++        remote_up[i] = true; /* Assume all remotes are up initially */
++    }
++
++    memset(remote_latency, 0, sizeof(int) * total_remotes);
++    memset(remote_addr_labels, 0, sizeof(char*) * total_remotes);
++    memset(remote_probes_total, 0, sizeof(long) * total_remotes);
++    memset(remote_probe_failures_total, 0, sizeof(long) * total_remotes);
++    memset(remote_tcp_connections, 0, sizeof(long) * total_remotes);
++    memset(remote_tcp_connections_total, 0, sizeof(long) * total_remotes);
++    memset(remote_tcp_failures_total, 0, sizeof(long) * total_remotes);
++    memset(remote_udp_sessions, 0, sizeof(long) * total_remotes);
++    memset(remote_udp_sessions_total, 0, sizeof(long) * total_remotes);
++    memset(remote_udp_session_timeouts_total, 0, sizeof(long) * total_remotes);
++
++    metrics_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (metrics_fd == -1) {
++        ERROR("metrics: socket");
++        return;
++    }
++
++    int opt = 1;
++    setsockopt(metrics_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++    setnonblocking(metrics_fd);
++
++    struct sockaddr_in sock_addr;
++    memset(&sock_addr, 0, sizeof(sock_addr));
++    sock_addr.sin_family = AF_INET;
++    sock_addr.sin_port = htons(port);
++    if (inet_pton(AF_INET, addr, &sock_addr.sin_addr) <= 0) {
++        ERROR("metrics: inet_pton");
++        close(metrics_fd);
++        metrics_fd = -1;
++        return;
++    }
++
++    if (bind(metrics_fd, (struct sockaddr *)&sock_addr, sizeof(sock_addr)) != 0) {
++        ERROR("metrics: bind");
++        close(metrics_fd);
++        metrics_fd = -1;
++        return;
++    }
++
++    if (listen(metrics_fd, SOMAXCONN) != 0) {
++        ERROR("metrics: listen");
++        close(metrics_fd);
++        metrics_fd = -1;
++        return;
++    }
++
++    ev_io_init(&metrics_watcher, metrics_accept_cb, metrics_fd, EV_READ);
++    ev_io_start(EV_A_ &metrics_watcher);
++
++    LOGI("Metrics server started on %s:%d", addr, port);
++}
++
++void
++metrics_cleanup(EV_P)
++{
++    if (metrics_fd != -1) {
++        ev_io_stop(EV_A_ &metrics_watcher);
++        close(metrics_fd);
++        metrics_fd = -1;
++    } else {
++    }
++    ss_free(remote_up);
++    ss_free(remote_latency);
++    ss_free(remote_probes_total);
++    ss_free(remote_probe_failures_total);
++    ss_free(remote_tcp_connections);
++    ss_free(remote_tcp_connections_total);
++    ss_free(remote_tcp_failures_total);
++    ss_free(remote_udp_sessions);
++    ss_free(remote_udp_sessions_total);
++    ss_free(remote_udp_session_timeouts_total);
++    if (remote_addr_labels) {
++        for (int i = 0; i < total_remotes; i++) {
++            ss_free(remote_addr_labels[i]);
++        }
++        ss_free(remote_addr_labels);
++    }
++
++}
++
++void metrics_inc_tcp_connections(void) {
++    __sync_fetch_and_add(&tcp_connections, 1);
++}
++
++void metrics_dec_tcp_connections(void) {
++    __sync_fetch_and_sub(&tcp_connections, 1);
++}
++
++void metrics_inc_tcp_connections_total(void) {
++    __sync_fetch_and_add(&tcp_connections_total, 1);
++}
++
++void metrics_set_udp_sessions(size_t count) {
++    pthread_mutex_lock(&metrics_lock);
++    udp_sessions = count;
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_udp_sessions_total(void) {
++    __sync_fetch_and_add(&udp_sessions_total, 1);
++}
++
++void metrics_inc_tcp_tx_bytes(size_t bytes) {
++    __sync_fetch_and_add(&tcp_tx_bytes_total, bytes);
++}
++
++void metrics_inc_tcp_rx_bytes(size_t bytes) {
++    __sync_fetch_and_add(&tcp_rx_bytes_total, bytes);
++}
++
++void metrics_inc_udp_tx_bytes(size_t bytes) {
++    __sync_fetch_and_add(&udp_tx_bytes_total, bytes);
++}
++
++void metrics_inc_udp_rx_bytes(size_t bytes) {
++    __sync_fetch_and_add(&udp_rx_bytes_total, bytes);
++}
++
++void metrics_set_remote_server_up(int idx, const char *addr, bool up) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx<total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_up[idx]=up;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_set_remote_server_latency(int idx, const char *addr, int latency_millisecs) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx<total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_latency[idx]=latency_millisecs;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_probes_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_probes_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_probe_failures_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_probe_failures_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_tcp_connections(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_tcp_connections[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_dec_remote_tcp_connections(int idx) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes && remote_tcp_connections[idx] > 0){
++        remote_tcp_connections[idx]--;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_tcp_connections_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_tcp_connections_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_tcp_failures_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_tcp_failures_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_udp_sessions(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_udp_sessions[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_dec_remote_udp_sessions(int idx) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes && remote_udp_sessions[idx] > 0){
++        remote_udp_sessions[idx]--;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_udp_sessions_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_udp_sessions_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
++
++void metrics_inc_remote_udp_session_timeouts_total(int idx, const char *addr) {
++    pthread_mutex_lock(&metrics_lock);
++    if(idx < total_remotes){
++        if(!remote_addr_labels[idx]) remote_addr_labels[idx]=strdup(addr);
++        remote_udp_session_timeouts_total[idx]++;
++    }
++    pthread_mutex_unlock(&metrics_lock);
++}
+diff --git a/src/metrics.h b/src/metrics.h
+new file mode 100644
+index 0000000..211c8af
+--- /dev/null
++++ b/src/metrics.h
+@@ -0,0 +1,55 @@
++/*
++ * metrics.h - Prometheus metrics exporter
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _METRICS_H
++#define _METRICS_H
++
++#include <ev.h>
++
++void metrics_init(EV_P_ const char *addr, uint16_t port, int remote_num, time_t start_time);
++void metrics_cleanup(EV_P);
++
++void metrics_inc_tcp_connections(void);
++void metrics_dec_tcp_connections(void);
++void metrics_inc_tcp_connections_total(void);
++void metrics_set_udp_sessions(size_t count);
++void metrics_inc_udp_sessions_total(void);
++
++void metrics_inc_tcp_tx_bytes(size_t bytes);
++void metrics_inc_tcp_rx_bytes(size_t bytes);
++void metrics_inc_udp_tx_bytes(size_t bytes);
++void metrics_inc_udp_rx_bytes(size_t bytes);
++
++void metrics_set_remote_server_up(int remote_idx, const char *remote_addr_str, bool up);
++void metrics_set_remote_server_latency(int remote_idx, const char *remote_addr_str, int latency_millisecs);
++void metrics_inc_remote_probes_total(int remote_idx, const char *remote_addr_str);
++void metrics_inc_remote_probe_failures_total(int remote_idx, const char *remote_addr_str);
++
++void metrics_inc_remote_tcp_connections(int remote_idx, const char *remote_addr_str);
++void metrics_dec_remote_tcp_connections(int remote_idx);
++void metrics_inc_remote_tcp_connections_total(int remote_idx, const char *remote_addr_str);
++void metrics_inc_remote_tcp_failures_total(int remote_idx, const char *remote_addr_str);
++
++void metrics_inc_remote_udp_sessions(int remote_idx, const char *remote_addr_str);
++void metrics_dec_remote_udp_sessions(int remote_idx);
++void metrics_inc_remote_udp_sessions_total(int remote_idx, const char *remote_addr_str);
++void metrics_inc_remote_udp_session_timeouts_total(int remote_idx, const char *remote_addr_str);
++
++#endif // _METRICS_H
+\ No newline at end of file
+diff --git a/src/probe.c b/src/probe.c
+index ad1c28f..841cdaf 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -32,6 +32,7 @@
+ #include "utils.h"
+ #include "netutils.h"
+ #include "udprelay.h"
++#include "metrics.h"
+ 
+ #define MAX_SERVERS 32
+ 
+@@ -147,7 +148,7 @@ static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
+             }
+         }
+     }
+-
++    
+     if (success) {
+         udp_probe_failure_count[p_ctx->remote_idx] = 0;
+         udp_probe_success_count[p_ctx->remote_idx]++;
+@@ -156,6 +157,7 @@ static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
+             udp_probe_success_count[p_ctx->remote_idx] >= probe_up_threshold) {
+             LOGI("[probe] remote %d is back online after %d successful probes.", p_ctx->remote_idx, udp_probe_success_count[p_ctx->remote_idx]);
+             p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = true;
++            metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, true);
+         }
+     } else {
+         udp_probe_success_count[p_ctx->remote_idx] = 0;
+@@ -165,9 +167,14 @@ static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
+             udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
+             LOGI("[probe] remote %d is offline after %d failed probes.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
+             p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++            metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, false);
+         }
++
++        metrics_inc_remote_probe_failures_total(p_ctx->remote_idx, addr_str);
+     }
+ 
++    metrics_set_remote_server_latency(p_ctx->remote_idx, addr_str, success ? latency*1000 : 0);
++
+     bfree(buf);
+     ss_free(buf);
+     udp_probe_cleanup(EV_A_ p_ctx);
+@@ -184,7 +191,11 @@ static void udp_probe_timeout_cb(EV_P_ ev_timer *w, int revents) {
+         udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
+         LOGI("[probe] remote %d is offline after %d probe timeouts.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
+         p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++        metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, false);
+     }
++
++    metrics_inc_remote_probe_failures_total(p_ctx->remote_idx, addr_str);
++
+     udp_probe_cleanup(EV_A_ p_ctx);
+ }
+ 
+@@ -240,6 +251,8 @@ static void start_one_udp_probe(EV_P_ server_ctx_t *s_ctx, int idx) {
+         return;
+     }
+ 
++    metrics_inc_remote_probes_total(idx, addr_str);
++
+     sendto(probefd, buf->data, buf->len, 0, remote_addr, get_sockaddr_len(remote_addr));
+     bfree(buf);
+     ss_free(buf);
+diff --git a/src/redir.c b/src/redir.c
+index 27fc0de..b014518 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -54,6 +54,7 @@
+ #include "redir.h"
+ #include "udprelay.h"
+ #include "probe.h"
++#include "metrics.h"
+ 
+ #ifndef EAGAIN
+ #define EAGAIN EWOULDBLOCK
+@@ -262,6 +263,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     }
+ 
+     remote->buf->len += r;
++    metrics_inc_tcp_rx_bytes(r);
+ 
+     if (verbose) {
+         uint16_t port = 0;
+@@ -444,6 +446,10 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+     int s = send(server->fd, server->buf->data, server->buf->len, 0);
+ 
++    if (s > 0) {
++        metrics_inc_tcp_tx_bytes(s);
++    }
++
+     if (s == -1) {
+         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+             // no data, wait for send
+@@ -719,6 +725,8 @@ close_and_free_server(EV_P_ server_t *server)
+         ev_io_stop(EV_A_ & server->send_ctx->io);
+         ev_io_stop(EV_A_ & server->recv_ctx->io);
+         ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
++        metrics_dec_remote_tcp_connections(server->remote_idx);
++        metrics_dec_tcp_connections();
+         close(server->fd);
+         free_server(server);
+     }
+@@ -737,6 +745,7 @@ handle_tcp_fail(EV_P_ server_t *server)
+             LOGI("tcp: handling failure for remote index %d", server->remote_idx);
+         }
+         const char *addr_str = get_addr_str(server->listener->remote_addr[server->remote_idx], true);
++        metrics_inc_remote_tcp_failures_total(server->remote_idx, addr_str);
+     }
+ 
+     /*
+@@ -761,10 +770,13 @@ start_connect_remote(EV_P_ server_t *server)
+ 
+     struct sockaddr *remote_addr = listener->remote_addr[server->remote_idx];
+     const char *addr_str = get_addr_str(remote_addr, true);
++
+     if (verbose) {
+         LOGI("tcp: attempting to connect to remote %d at %s", server->remote_idx, addr_str);
+     }
+ 
++    metrics_inc_remote_tcp_connections_total(server->remote_idx, addr_str);
++
+     int protocol = IPPROTO_TCP;
+     if (listener->mptcp < 0) {
+         protocol = IPPROTO_MPTCP; // Enable upstream MPTCP
+@@ -940,6 +952,9 @@ accept_cb(EV_P_ ev_io *w, int revents)
+    if (verbose) {
+         LOGI("tcp: starting to connect remote for fd %d", serverfd);
+     }
++    metrics_inc_tcp_connections();
++    metrics_inc_tcp_connections_total();
++    metrics_inc_remote_tcp_connections(server->remote_idx, get_addr_str(listener->remote_addr[server->remote_idx], true));
+     start_connect_remote(EV_A_ server);
+ }
+ 
+@@ -959,6 +974,7 @@ signal_cb(EV_P_ ev_signal *w, int revents)
+             ev_signal_stop(EV_DEFAULT, &sigint_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
++            metrics_cleanup(EV_A);
+             probe_cleanup(EV_A);
+ 
+             ev_unloop(EV_A_ EVUNLOOP_ALL);
+@@ -970,7 +986,8 @@ signal_cb(EV_P_ ev_signal *w, int revents)
+ int
+ main(int argc, char **argv)
+ {
+-    srand(time(NULL));
++    time_t start_time = time(NULL);
++    srand(start_time);
+ 
+     int i, c;
+     int pid_flags    = 0;
+@@ -990,6 +1007,7 @@ main(int argc, char **argv)
+     char *plugin_opts = NULL;
+     char *plugin_host = NULL;
+     char *plugin_port = NULL;
++    uint16_t metrics_port = 0;
+     int probe_interval = 0;
+     int probe_timeout = 0;
+     int probe_up_count = 0;
+@@ -1026,6 +1044,7 @@ main(int argc, char **argv)
+         { "probe-up-count", required_argument, NULL, GETOPT_VAL_PROBE_UP_COUNT },
+         { "probe-down-count", required_argument, NULL, GETOPT_VAL_PROBE_DOWN_COUNT },
+         { "probe-domain", required_argument, NULL, GETOPT_VAL_PROBE_DOMAIN },
++        { "metrics-port", required_argument, NULL, GETOPT_VAL_METRICS_PORT },
+         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
+         { NULL,          0,                 NULL, 0                      }
+     };
+@@ -1034,7 +1053,7 @@ main(int argc, char **argv)
+ 
+     USE_TTY();
+ 
+-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUTv6A",
++    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUTv6A:",
+                             long_options, NULL)) != -1) {
+         switch (c) {
+         case GETOPT_VAL_FAST_OPEN:
+@@ -1076,6 +1095,9 @@ main(int argc, char **argv)
+         case GETOPT_VAL_PROBE_DOMAIN:
+             probe_domain = optarg;
+             break;
++        case GETOPT_VAL_METRICS_PORT:
++            metrics_port = atoi(optarg);
++            break;
+         case GETOPT_VAL_REUSE_PORT:
+             reuse_port = 1;
+             break;
+@@ -1269,6 +1291,9 @@ main(int argc, char **argv)
+         if (probe_domain == NULL) {
+             probe_domain = conf->probe_domain;
+         }
++        if (metrics_port == 0) {
++            metrics_port = conf->metrics_port;
++        }
+     }
+ 
+     if (remote_num == 0 || remote_port == NULL || local_port == NULL
+@@ -1437,6 +1462,11 @@ main(int argc, char **argv)
+ 
+     probe_init(EV_A_ probe_interval, probe_timeout, probe_up_count, probe_down_count, probe_domain);
+ 
++    if (metrics_port > 0) {
++        const char *metrics_addr = "0.0.0.0";
++        metrics_init(EV_A_ metrics_addr, metrics_port, remote_num, start_time);
++    }
++
+     LOGI("initializing ciphers... %s", method);
+     crypto = crypto_init(password, key, method);
+     if (crypto == NULL)
+diff --git a/src/udprelay.c b/src/udprelay.c
+index 7b27633..98d80e8 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -53,6 +53,7 @@
+ #include "cache.h"
+ #include "udprelay.h"
+ #include "probe.h"
++#include "metrics.h"
+ #include "winsock.h"
+ #define MAX_UDP_CONN_NUM 256
+ 
+@@ -438,6 +439,7 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+     if (remote_ctx->state == STATE_AWAITING_REPLY) {
+         const char *addr_str = get_addr_str(server_ctx->remote_addr[remote_ctx->remote_idx], true);
+         LOGI("[udprelay] session timed out for remote %d (%s) waiting for reply.", remote_ctx->remote_idx, addr_str);
++        metrics_inc_remote_udp_session_timeouts_total(remote_ctx->remote_idx, addr_str);
+     } else {
+         if (verbose) LOGI("[udp] idle session timed out.");
+     }
+@@ -567,6 +569,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+     ssize_t s = sendto(reply_fd, buf->data, buf->len, 0,
+                    (struct sockaddr *)&mapped_src_addr, remote_src_addr_len);
++    if (s > 0) {
++        metrics_inc_udp_tx_bytes(s);
++    }
+ 
+     close(reply_fd);
+ 
+@@ -627,6 +632,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         LOGI("[udp] server_recv_recvfrom fragmentation: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
+     }
+     buf->len = r;
++    metrics_inc_udp_rx_bytes(r);
+ 
+     struct cmsghdr *cmsg;
+     for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL; cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+@@ -746,7 +752,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+         /* 插入 cache（cache 应复制 key 内容） */
+         cache_insert(conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
+-
++        const char *addr_str = get_addr_str(server_ctx->remote_addr[remote_ctx->remote_idx], true);
++        metrics_inc_remote_udp_sessions(remote_ctx->remote_idx, addr_str);
++        metrics_inc_remote_udp_sessions_total(remote_ctx->remote_idx, addr_str);
++        metrics_inc_udp_sessions_total();
++        metrics_set_udp_sessions(HASH_COUNT(conn_cache->entries));
+         ev_io_start(EV_A_ & remote_ctx->io);
+         ev_timer_start(EV_A_ & remote_ctx->watcher);
+     }
+@@ -816,6 +826,8 @@ free_cb(void *key, void *element)
+ {
+     remote_ctx_t *remote_ctx = (remote_ctx_t *)element;
+     if (verbose) LOGI("[udp] freeing remote_ctx %p", (void *)remote_ctx);
++    metrics_dec_remote_udp_sessions(remote_ctx->remote_idx);
++    metrics_set_udp_sessions(HASH_COUNT(remote_ctx->server_ctx->conn_cache->entries));
+     if (remote_ctx) close_and_free_remote(EV_DEFAULT, remote_ctx);
+ }
+ 
+diff --git a/src/utils.c b/src/utils.c
+index 8b7415a..6862058 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -384,6 +384,8 @@ usage()
+         "       [--probe-down-count <cnt>] Failure count to mark a remote as down (default: 3).\n");
+     printf(
+         "       [--probe-domain <domain>]  Domain to use for probing (default: www.google.com).\n");
++    printf(
++        "       [--metrics-port <port>]    Port to expose Prometheus metrics.\n");
+     printf("\n");
+     printf(
+         "       [-v]                       Verbose mode.\n");
+-- 
+2.37.1 (Apple Git-137.1)
+

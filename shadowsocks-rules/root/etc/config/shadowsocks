@@ -1,5 +1,5 @@
 config servers main
-	option server '12.34.56.78'
+	list server '1.2.3.4'
 	option server_port '1234'
 	option encrypt_method 'chacha20-ietf-poly1305'
 	option password 'pass'
@@ -9,7 +9,11 @@ config servers main
 	option timeout '60'
 	option fast_open '1'
 	option no_delay '1'
-	option fwmark '255'
+	option probe_interval '30'
+	option probe_timeout '5'
+	option probe_up_count '1'
+	option probe_down_count '3'
+	option probe_domain 'www.google.com'
 
 config redir
 	option main_server main

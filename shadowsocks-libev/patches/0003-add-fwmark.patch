@@ -1,0 +1,253 @@
+From 7dc00d197f00376f43fd366246f261adb40fce5f Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Mon, 22 Sep 2025 21:38:55 +0800
+Subject: [PATCH 3/6] add fwmark
+
+---
+ src/common.h   |  5 +++--
+ src/jconf.c    |  8 ++++++++
+ src/jconf.h    |  1 +
+ src/redir.c    | 39 +++++++++++++++++++++++++++++++++------
+ src/udprelay.c | 12 +++++++++++-
+ src/udprelay.h |  1 +
+ src/utils.c    |  2 ++
+ 7 files changed, 59 insertions(+), 9 deletions(-)
+
+diff --git a/src/common.h b/src/common.h
+index d642fd0..d45d773 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -30,7 +30,7 @@
+ 
+ int init_udprelay(const char *server_host, const char *server_port,
+                   const struct sockaddr *remote_addr, const int remote_addr_len,
+-                  int mtu, crypto_t *crypto, int timeout, const char *iface);
++                  int mtu, crypto_t *crypto, int timeout, const char *iface, int fwmark);
+ 
+ void free_udprelay(void);
+ 
+@@ -56,7 +56,8 @@ enum {
+     GETOPT_VAL_TCP_INCOMING_SNDBUF,
+     GETOPT_VAL_TCP_INCOMING_RCVBUF,
+     GETOPT_VAL_TCP_OUTGOING_SNDBUF,
+-    GETOPT_VAL_TCP_OUTGOING_RCVBUF
++    GETOPT_VAL_TCP_OUTGOING_RCVBUF,
++    GETOPT_VAL_FWMARK,
+ };
+ 
+ #endif // _COMMON_H
+diff --git a/src/jconf.c b/src/jconf.c
+index d2815ef..e72bc8b 100644
+--- a/src/jconf.c
++++ b/src/jconf.c
+@@ -155,6 +155,9 @@ parse_dscp(char *str)
+ jconf_t *
+ read_jconf(const char *file)
+ {
++    // json-c doesn't support integer initialization other than 0
++    // see: https://github.com/json-c/json-c/issues/610
++    // Thus, we use memset to zero out the whole struct
+     static jconf_t conf;
+ 
+     memset(&conf, 0, sizeof(jconf_t));
+@@ -363,6 +366,11 @@ read_jconf(const char *file)
+                 conf.tcp_tproxy = value->u.boolean;
+             } else if (strcmp(name, "workdir") == 0) {
+                 conf.workdir = to_string(value);
++            } else if (strcmp(name, "fwmark") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'fwmark' must be an integer");
++                conf.fwmark = value->u.integer;
+             } else if (strcmp(name, "acl") == 0) {
+                 conf.acl = to_string(value);
+             } else if (strcmp(name, "manager_address") == 0) {
+diff --git a/src/jconf.h b/src/jconf.h
+index 544011d..1955536 100644
+--- a/src/jconf.h
++++ b/src/jconf.h
+@@ -90,6 +90,7 @@ typedef struct {
+     char *workdir;
+     char *acl;
+     char *manager_address;
++    int fwmark;
+ } jconf_t;
+ 
+ jconf_t *read_jconf(const char *file);
+diff --git a/src/redir.c b/src/redir.c
+index d36fe3f..d242a61 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -103,6 +103,7 @@ static int nofile = 0;
+ #endif
+ int fast_open       = 0;
+ static int no_delay = 0;
++static int fwmark = 0;
+ static int ret_val  = 0;
+ 
+ static struct ev_signal sigint_watcher;
+@@ -198,7 +199,6 @@ create_and_bind(const char *addr, const char *port)
+                 ERROR("setsockopt IP_TRANSPARENT");
+                 exit(EXIT_FAILURE);
+             }
+-            LOGI("tcp tproxy mode enabled");
+         }
+ 
+         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
+@@ -840,6 +840,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
+         setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
+     }
+ 
++#ifdef SO_MARK
++    if (fwmark > 0) {
++        if (setsockopt(remotefd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark)) != 0) {
++            ERROR("setsockopt SO_MARK");
++        }
++    }
++#endif
++
+     server_t *server = new_server(serverfd);
+     remote_t *remote = new_remote(remotefd, listener->timeout);
+     server->remote   = remote;
+@@ -936,6 +944,7 @@ main(int argc, char **argv)
+         { "no-delay",    no_argument,       NULL, GETOPT_VAL_NODELAY     },
+         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
+         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
++        { "fwmark",      required_argument, NULL, GETOPT_VAL_FWMARK      },
+         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
+         { NULL,          0,                 NULL, 0                      }
+     };
+@@ -952,16 +961,12 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_MTU:
+             mtu = atoi(optarg);
+-            LOGI("set MTU to %d", mtu);
+             break;
+         case GETOPT_VAL_MPTCP:
+             mptcp = get_mptcp(1);
+-            if (mptcp)
+-                LOGI("enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
+             break;
+         case GETOPT_VAL_NODELAY:
+             no_delay = 1;
+-            LOGI("enable TCP no-delay");
+             break;
+         case GETOPT_VAL_PLUGIN:
+             plugin = optarg;
+@@ -972,6 +977,9 @@ main(int argc, char **argv)
+         case GETOPT_VAL_KEY:
+             key = optarg;
+             break;
++        case GETOPT_VAL_FWMARK:
++            fwmark = atoi(optarg);
++            break;
+         case GETOPT_VAL_REUSE_PORT:
+             reuse_port = 1;
+             break;
+@@ -1147,6 +1155,9 @@ main(int argc, char **argv)
+         }
+         dscp_num = conf->dscp_num;
+         dscp     = conf->dscp;
++        if (fwmark == 0 && conf->fwmark > 0) {
++            fwmark = conf->fwmark;
++        }
+     }
+ 
+     if (remote_num == 0 || remote_port == NULL || local_port == NULL
+@@ -1222,6 +1233,22 @@ main(int argc, char **argv)
+         LOGI("resolving hostname to IPv6 address first");
+     }
+ 
++    if (mptcp != 0){
++        LOGI("[redir]enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
++    }
++
++    if (mtu > 0) {
++        LOGI("[redir] set MTU to %d", mtu);
++    }
++
++    if (timeout) {
++        LOGI("[redir] set timeout to %s", timeout);
++    }
++
++    if (fwmark > 0) {
++        LOGI("[redir] set fwmark to %d", fwmark);
++    }
++
+     if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+         tcp_incoming_sndbuf = 0;
+     }
+@@ -1355,7 +1382,7 @@ main(int argc, char **argv)
+             }
+             struct sockaddr *addr = (struct sockaddr *)storage;
+             init_udprelay(local_addr, local_port, addr,
+-                          get_sockaddr_len(addr), mtu, crypto, listen_ctx_current->timeout, NULL);
++                          get_sockaddr_len(addr), mtu, crypto, listen_ctx_current->timeout, NULL, fwmark);
+         }
+ 
+         if (mode == UDP_ONLY) {
+diff --git a/src/udprelay.c b/src/udprelay.c
+index 578e024..b786e13 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -852,6 +852,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         }
+         setnonblocking(remotefd);
+ 
++#ifdef SO_MARK
++        if (server_ctx->fwmark > 0) {
++            if (setsockopt(remotefd, SOL_SOCKET, SO_MARK, &server_ctx->fwmark,
++                           sizeof(server_ctx->fwmark)) != 0) {
++                ERROR("setsockopt SO_MARK");
++            }
++        }
++#endif
++
+ #ifdef SO_NOSIGPIPE
+         set_nosigpipe(remotefd);
+ #endif
+@@ -932,7 +941,7 @@ free_cb(void *key, void *element)
+ int
+ init_udprelay(const char *server_host, const char *server_port,
+               const struct sockaddr *remote_addr, const int remote_addr_len,
+-              int mtu, crypto_t *crypto, int timeout, const char *iface)
++              int mtu, crypto_t *crypto, int timeout, const char *iface, int fwmark)
+ {
+     s_port = server_port;
+     // Initialize ev loop
+@@ -963,6 +972,7 @@ init_udprelay(const char *server_host, const char *server_port,
+     server_ctx->crypto     = crypto;
+     server_ctx->iface      = iface;
+     server_ctx->conn_cache = conn_cache;
++    server_ctx->fwmark = fwmark;
+     server_ctx->remote_addr     = remote_addr;
+     server_ctx->remote_addr_len = remote_addr_len;
+ 
+diff --git a/src/udprelay.h b/src/udprelay.h
+index 132c9cc..8f071dc 100644
+--- a/src/udprelay.h
++++ b/src/udprelay.h
+@@ -53,6 +53,7 @@ typedef struct server_ctx {
+     struct cache *conn_cache;
+     const struct sockaddr *remote_addr;
+     int remote_addr_len;
++    int fwmark;
+ } server_ctx_t;
+ 
+ typedef struct remote_ctx {
+diff --git a/src/utils.c b/src/utils.c
+index 553e1ac..ff4a16b 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -362,6 +362,8 @@ usage()
+         "       [--plugin <name>]          Enable SIP003 plugin. (Experimental)\n");
+     printf(
+         "       [--plugin-opts <options>]  Set SIP003 plugin options. (Experimental)\n");
++    printf(
++        "       [--fwmark <mark>]          Set firewall mark for outgoing packets.\n");
+     printf("\n");
+     printf(
+         "       [-v]                       Verbose mode.\n");
+-- 
+2.37.1 (Apple Git-137.1)
+
