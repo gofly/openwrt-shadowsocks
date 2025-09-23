@@ -1,7 +1,7 @@
 From e3fa2b3d93bb2095b2257ed25b91c937b9bfcfbe Mon Sep 17 00:00:00 2001
 From: zhenglixin <lixin.zhenglx@gmail.com>
 Date: Tue, 23 Sep 2025 22:11:14 +0800
-Subject: [PATCH 4/4] TCP failover
+Subject: [PATCH 4/9] TCP failover
 
 ---
  src/redir.c | 219 ++++++++++++++++++++++++++++++++++++++--------------

@@ -1,0 +1,711 @@
+From 6eaed6d02cdb465d966ab7cb407c81ef33978714 Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Wed, 24 Sep 2025 12:16:27 +0800
+Subject: [PATCH 7/9] probe
+
+---
+ src/probe.c    | 280 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/probe.h    |  35 +++++++
+ src/redir.c    |  92 ++++++++--------
+ src/redir.h    |   2 +-
+ src/udprelay.c |  94 +++++++++--------
+ 5 files changed, 411 insertions(+), 92 deletions(-)
+ create mode 100644 src/probe.c
+ create mode 100644 src/probe.h
+
+diff --git a/src/probe.c b/src/probe.c
+new file mode 100644
+index 0000000..36c2e94
+--- /dev/null
++++ b/src/probe.c
+@@ -0,0 +1,280 @@
++/*
++ * probe.c - Active probing for remote server status
++ *
++ * Copyright (C) 2019, zkc <zkc@tcpip.fun>
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++
++#include <libcork/core.h>
++
++#include "probe.h"
++#include "utils.h"
++#include "netutils.h"
++
++#define MAX_LISTENERS 32
++
++/* TCP Probe */
++typedef struct tcp_probe_ctx {
++    ev_io io;
++    ev_timer watcher;
++    int remote_idx;
++    listen_ctx_t *listener;
++} tcp_probe_ctx_t;
++
++static ev_timer tcp_probe_timer;
++static listen_ctx_t *tcp_listeners[MAX_LISTENERS] = { NULL };
++static int tcp_listener_count = 0;
++
++/* UDP Probe */
++typedef struct udp_probe_ctx {
++    ev_io io;
++    ev_timer watcher;
++    int remote_idx;
++    server_ctx_t *server_ctx;
++    crypto_t *crypto;
++} udp_probe_ctx_t;
++
++static ev_timer udp_probe_timer;
++static server_ctx_t *udp_servers[MAX_LISTENERS] = { NULL };
++static int udp_server_count = 0;
++
++static const unsigned char dns_probe_packet[] = {
++    0xDB, 0x42, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x03, 0x77, 0x77, 0x77,
++    0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03,
++    0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01
++};
++
++/* TCP Probe Implementation */
++static void tcp_probe_cleanup(EV_P_ tcp_probe_ctx_t *p_ctx) {
++    ev_io_stop(EV_A_ &p_ctx->io);
++    ev_timer_stop(EV_A_ &p_ctx->watcher);
++    close(p_ctx->io.fd);
++    ss_free(p_ctx);
++}
++
++static void tcp_probe_connect_cb(EV_P_ ev_io *w, int revents) {
++    tcp_probe_ctx_t *p_ctx = (tcp_probe_ctx_t *)w;
++    int err;
++    socklen_t len = sizeof(err);
++
++    if (getsockopt(w->fd, SOL_SOCKET, SO_ERROR, &err, &len) == -1) {
++        err = errno;
++    }
++
++    if (err == 0) {
++        if (!p_ctx->listener->remote_status[p_ctx->remote_idx]) {
++            LOGI("[tcp-probe] remote %d is back online.", p_ctx->remote_idx);
++        }
++        p_ctx->listener->remote_status[p_ctx->remote_idx] = true;
++    } else {
++        if (p_ctx->listener->remote_status[p_ctx->remote_idx]) {
++            LOGI("[tcp-probe] remote %d is offline: %s", p_ctx->remote_idx, strerror(err));
++        }
++        p_ctx->listener->remote_status[p_ctx->remote_idx] = false;
++    }
++    tcp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void tcp_probe_timeout_cb(EV_P_ ev_timer *w, int revents) {
++    tcp_probe_ctx_t *p_ctx = cork_container_of(w, tcp_probe_ctx_t, watcher);
++    if (p_ctx->listener->remote_status[p_ctx->remote_idx]) {
++        LOGI("[tcp-probe] remote %d timed out.", p_ctx->remote_idx);
++    }
++    p_ctx->listener->remote_status[p_ctx->remote_idx] = false;
++    tcp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void start_one_tcp_probe(EV_P_ listen_ctx_t *listener, int idx) {
++    struct sockaddr *remote_addr = listener->remote_addr[idx];
++    int probefd = socket(remote_addr->sa_family, SOCK_STREAM, 0);
++    if (probefd == -1) {
++        listener->remote_status[idx] = false;
++        return;
++    }
++
++    setnonblocking(probefd);
++
++    tcp_probe_ctx_t *p_ctx = ss_malloc(sizeof(tcp_probe_ctx_t));
++    memset(p_ctx, 0, sizeof(tcp_probe_ctx_t));
++    p_ctx->listener = listener;
++    p_ctx->remote_idx = idx;
++
++    ev_io_init(&p_ctx->io, tcp_probe_connect_cb, probefd, EV_WRITE);
++    ev_timer_init(&p_ctx->watcher, tcp_probe_timeout_cb, min(MAX_CONNECT_TIMEOUT, 5), 0);
++
++    if (connect(probefd, remote_addr, get_sockaddr_len(remote_addr)) != 0 && errno != EINPROGRESS) {
++        listener->remote_status[idx] = false;
++        close(probefd);
++        ss_free(p_ctx);
++        return;
++    }
++
++    ev_io_start(EV_A_ &p_ctx->io);
++    ev_timer_start(EV_A_ &p_ctx->watcher);
++}
++
++static void tcp_probe_timer_cb(EV_P_ ev_timer *w, int revents) {
++    for (int i = 0; i < tcp_listener_count; i++) {
++        listen_ctx_t *lc = tcp_listeners[i];
++        if (lc && lc->remote_num > 1) {
++            for (int j = 0; j < lc->remote_num; j++) {
++                start_one_tcp_probe(EV_A_ lc, j);
++            }
++        }
++    }
++}
++
++/* UDP Probe Implementation */
++static void udp_probe_cleanup(EV_P_ udp_probe_ctx_t *p_ctx) {
++    ev_io_stop(EV_A_ &p_ctx->io);
++    ev_timer_stop(EV_A_ &p_ctx->watcher);
++    close(p_ctx->io.fd);
++    ss_free(p_ctx);
++}
++
++static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
++    udp_probe_ctx_t *p_ctx = (udp_probe_ctx_t *)w;
++    buffer_t *buf = ss_malloc(sizeof(buffer_t));
++    balloc(buf, MAX_UDP_PACKET_SIZE);
++
++    ssize_t r = recv(p_ctx->io.fd, buf->data, MAX_UDP_PACKET_SIZE, 0);
++    bool success = false;
++    if (r > 0) {
++        buf->len = r;
++        if (p_ctx->crypto->decrypt_all(buf, p_ctx->crypto->cipher, buf->capacity) == 0) {
++            if (buf->len > 3 && (buf->data[3] & 0x0F) == 0) {
++                success = true;
++            }
++        }
++    }
++
++    if (success) {
++        if (!p_ctx->server_ctx->remote_status[p_ctx->remote_idx]) {
++            LOGI("[udp-probe] remote %d is back online.", p_ctx->remote_idx);
++        }
++        p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = true;
++    } else {
++        if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx]) {
++            LOGI("[udp-probe] remote %d failed probe.", p_ctx->remote_idx);
++        }
++        p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++    }
++
++    bfree(buf);
++    ss_free(buf);
++    udp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void udp_probe_timeout_cb(EV_P_ ev_timer *w, int revents) {
++    udp_probe_ctx_t *p_ctx = cork_container_of(w, udp_probe_ctx_t, watcher);
++    if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx]) {
++        LOGI("[udp-probe] remote %d timed out.", p_ctx->remote_idx);
++    }
++    p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++    udp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void start_one_udp_probe(EV_P_ server_ctx_t *s_ctx, int idx) {
++    struct sockaddr *remote_addr = s_ctx->remote_addr[idx];
++    int probefd = socket(remote_addr->sa_family, SOCK_DGRAM, 0);
++    if (probefd == -1) return;
++
++    setnonblocking(probefd);
++
++    buffer_t *buf = ss_malloc(sizeof(buffer_t));
++    balloc(buf, sizeof(dns_probe_packet) + MAX_ADDR_HEADER_SIZE);
++    memcpy(buf->data, dns_probe_packet, sizeof(dns_probe_packet));
++    buf->len = sizeof(dns_probe_packet);
++
++    if (s_ctx->crypto->encrypt_all(buf, s_ctx->crypto->cipher, buf->capacity) != 0) {
++        bfree(buf);
++        ss_free(buf);
++        close(probefd);
++        return;
++    }
++
++    sendto(probefd, buf->data, buf->len, 0, remote_addr, get_sockaddr_len(remote_addr));
++    bfree(buf);
++    ss_free(buf);
++
++    udp_probe_ctx_t *p_ctx = ss_malloc(sizeof(udp_probe_ctx_t));
++    memset(p_ctx, 0, sizeof(udp_probe_ctx_t));
++    p_ctx->server_ctx = s_ctx;
++    p_ctx->remote_idx = idx;
++    p_ctx->crypto = s_ctx->crypto;
++
++    ev_io_init(&p_ctx->io, udp_probe_recv_cb, probefd, EV_READ);
++    ev_timer_init(&p_ctx->watcher, udp_probe_timeout_cb, 5.0, 0);
++    ev_io_start(EV_A_ &p_ctx->io);
++    ev_timer_start(EV_A_ &p_ctx->watcher);
++}
++
++static void udp_probe_timer_cb(EV_P_ ev_timer *w, int revents) {
++    for (int i = 0; i < udp_server_count; i++) {
++        server_ctx_t *s_ctx = udp_servers[i];
++        if (s_ctx && s_ctx->remote_num > 1) {
++            for (int j = 0; j < s_ctx->remote_num; j++) {
++                start_one_udp_probe(EV_A_ s_ctx, j);
++            }
++        }
++    }
++}
++
++/* Public Interface */
++void probe_init(EV_P_ int tcp_interval, int udp_interval) {
++    ev_timer_init(&tcp_probe_timer, tcp_probe_timer_cb, tcp_interval, tcp_interval);
++    ev_timer_init(&udp_probe_timer, udp_probe_timer_cb, udp_interval, udp_interval);
++}
++
++void probe_add_tcp_listener(listen_ctx_t *listener) {
++    if (tcp_listener_count < MAX_LISTENERS) {
++        tcp_listeners[tcp_listener_count++] = listener;
++        if (listener->remote_num > 1 && !ev_is_active(&tcp_probe_timer)) {
++            ev_timer_start(EV_DEFAULT, &tcp_probe_timer);
++        }
++    } else {
++        LOGE("[probe] too many tcp listeners");
++    }
++}
++
++void probe_add_udp_server(server_ctx_t *server) {
++    if (udp_server_count < MAX_LISTENERS) {
++        udp_servers[udp_server_count++] = server;
++        if (server->remote_num > 1 && !ev_is_active(&udp_probe_timer)) {
++            ev_timer_start(EV_DEFAULT, &udp_probe_timer);
++        }
++    } else {
++        LOGE("[probe] too many udp servers");
++    }
++}
++
++void probe_cleanup(EV_P) {
++    if (ev_is_active(&tcp_probe_timer)) {
++        ev_timer_stop(EV_A_ &tcp_probe_timer);
++    }
++    if (ev_is_active(&udp_probe_timer)) {
++        ev_timer_stop(EV_A_ &udp_probe_timer);
++    }
++}
+\ No newline at end of file
+diff --git a/src/probe.h b/src/probe.h
+new file mode 100644
+index 0000000..e692aa5
+--- /dev/null
++++ b/src/probe.h
+@@ -0,0 +1,35 @@
++/*
++ * probe.h - Active probing for remote server status
++ *
++ * Copyright (C) 2019, zkc <zkc@tcpip.fun>
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _PROBE_H
++#define _PROBE_H
++
++#include <ev.h>
++#include "redir.h"
++#include "udprelay.h"
++
++void probe_init(EV_P_ int tcp_interval, int udp_interval);
++void probe_add_tcp_listener(listen_ctx_t *listener);
++void probe_add_udp_server(server_ctx_t *server);
++void probe_cleanup(EV_P);
++
++#endif // _PROBE_H
+\ No newline at end of file
+diff --git a/src/redir.c b/src/redir.c
+index 9f870a0..ceb563f 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -112,30 +112,8 @@ static struct ev_signal sigchld_watcher;
+ static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
+ 
+ #define MAX_LISTEN_CTX 32
+-static listen_ctx_t *listen_ctx_list[MAX_LISTEN_CTX];
+-static int listen_ctx_count = 0;
+-
+-static ev_timer failback_watcher;
+-static int failback_timeout = 300; /* seconds */
+-
+-static void
+-failback_cb(EV_P_ ev_timer *w, int revents)
+-{
+-    (void)w;
+-    (void)revents;
+-
+-    /* Reset each listener's preferred index back to 0 (first remote) */
+-    for (int i = 0; i < listen_ctx_count; i++) {
+-        listen_ctx_t *lc = listen_ctx_list[i];
+-        if (lc) {
+-            if (lc->preferred_remote_idx != 0) {
+-                LOGI("failback: resetting listener %p preferred_remote_idx %d -> 0",
+-                     (void *)lc, lc->preferred_remote_idx);
+-            }
+-            lc->preferred_remote_idx = 0;
+-        }
+-    }
+-}
++static listen_ctx_t *listen_ctx_list[MAX_LISTEN_CTX] = { NULL };
++static int listen_ctx_count                          = 0;
+ 
+ static int
+ getdestaddr(int fd, struct sockaddr_storage *destaddr)
+@@ -505,11 +483,6 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         if (r == 0) {
+             remote_send_ctx->connected = 1;
+ 
+-            /* Connection succeeded — make this listener prefer this remote */
+-            if (server->listener) {
+-                server->listener->preferred_remote_idx = server->remote_idx;
+-            }
+-
+             ev_io_stop(EV_A_ & remote_send_ctx->io);
+             ev_io_stop(EV_A_ & server->recv_ctx->io);
+             ev_io_start(EV_A_ & remote->recv_ctx->io);
+@@ -771,6 +744,12 @@ failover_to_next_remote(EV_P_ server_t *server)
+         server->remote = NULL;
+     }
+ 
++    /* Mark current remote as down */
++    if (server->listener) {
++        server->listener->remote_status[server->remote_idx] = false;
++        LOGI("failover: marked remote %d as offline.", server->remote_idx);
++    }
++
+     /*
+      * Reset cipher context before trying the next remote.
+      * Each new connection attempt to a remote must start with a fresh cipher context,
+@@ -779,13 +758,23 @@ failover_to_next_remote(EV_P_ server_t *server)
+     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
+     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+ 
+-    /* advance to next remote index for this server + listener */
++    /* find next available remote index for this server + listener */
++    int next_idx = -1;
+     if (server->listener && server->listener->remote_num > 0) {
+-        server->remote_idx = (server->remote_idx + 1) % server->listener->remote_num;
+-    } else {
+-        server->remote_idx = 0;
++        for (int i = 1; i < server->listener->remote_num; i++) {
++            int check_idx = (server->remote_idx + i) % server->listener->remote_num;
++            if (server->listener->remote_status[check_idx]) {
++                next_idx = check_idx;
++                break;
++            }
++        }
+     }
+-
++    if (next_idx == -1) {
++        LOGE("failover: no other remote servers available.");
++        close_and_free_server(EV_A_ server);
++        return;
++    }
++    server->remote_idx = next_idx;
+     LOGI("failover: server %p now trying remote_idx %d", (void *)server, server->remote_idx);
+ 
+     start_connect_remote(EV_A_ server);
+@@ -924,13 +913,24 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     server_t *server = new_server(serverfd);
+     server->destaddr = destaddr;
+ 
+-    /* associate with listener and initialize remote_idx from listener's preference */
++    /* associate with listener and find first available remote */
+     server->listener = listener;
+-    server->remote_idx = 0;
+-    if (listener) {
+-        server->remote_idx = listener->preferred_remote_idx;
++    int start_idx = -1;
++    if (listener && listener->remote_num > 0) {
++        for (int i = 0; i < listener->remote_num; i++) {
++            if (listener->remote_status[i]) {
++                start_idx = i;
++                break;
++            }
++        }
+     }
+-
++    if (start_idx == -1) {
++        LOGE("No remote servers available, dropping connection.");
++        close(serverfd);
++        free_server(server);
++        return;
++    }
++    server->remote_idx = start_idx;
+     start_connect_remote(EV_A_ server);
+ }
+ 
+@@ -950,6 +950,7 @@ signal_cb(EV_P_ ev_signal *w, int revents)
+             ev_signal_stop(EV_DEFAULT, &sigint_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
++    probe_cleanup(EV_A);
+ 
+             ev_unloop(EV_A_ EVUNLOOP_ALL);
+         }
+@@ -1298,13 +1299,7 @@ main(int argc, char **argv)
+     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
+ 
+-    /* failback timer: only enable when multiple remotes configured */
+-    ev_timer_init(&failback_watcher, failback_cb, failback_timeout, failback_timeout);
+-    if (remote_num > 1) {
+-        ev_timer_start(EV_DEFAULT, &failback_watcher);
+-    }
+-
+-    /* Setup keys */
++    probe_init(EV_A_ 60, 60);
+     LOGI("initializing ciphers... %s", method);
+     crypto = crypto_init(password, key, method);
+     if (crypto == NULL)
+@@ -1316,9 +1311,10 @@ main(int argc, char **argv)
+     listen_ctx.remote_num  = remote_num;
+     listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
+     memset(listen_ctx.remote_addr, 0, sizeof(struct sockaddr *) * remote_num);
+-    listen_ctx.preferred_remote_idx = 0; /* default prefer first remote */
++    listen_ctx.remote_status = ss_malloc(sizeof(bool) * remote_num);
+ 
+     for (i = 0; i < remote_num; i++) {
++        listen_ctx.remote_status[i] = true; /* Assume all are up initially */
+         char *host = remote_addr[i].host;
+         char *port = remote_addr[i].port == NULL ? remote_port :
+                      remote_addr[i].port;
+@@ -1349,6 +1345,7 @@ main(int argc, char **argv)
+     /* register first (stack) listen_ctx */
+     if (listen_ctx_count < MAX_LISTEN_CTX) {
+         listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
++        probe_add_tcp_listener(listen_ctx_current);
+     } else {
+         LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
+     }
+@@ -1404,6 +1401,7 @@ main(int argc, char **argv)
+             /* register the newly allocated listener pointer for failback */
+             if (listen_ctx_count < MAX_LISTEN_CTX) {
+                 listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
++                probe_add_tcp_listener(listen_ctx_current);
+             } else {
+                 LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
+             }
+diff --git a/src/redir.h b/src/redir.h
+index 042b631..5472dea 100644
+--- a/src/redir.h
++++ b/src/redir.h
+@@ -38,7 +38,7 @@ typedef struct listen_ctx {
+     int fd;
+     int mptcp;
+     int tos;
+-    int preferred_remote_idx;
++    volatile bool *remote_status;
+     struct sockaddr **remote_addr;
+ } listen_ctx_t;
+ 
+diff --git a/src/udprelay.c b/src/udprelay.c
+index 34071a1..4c05889 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -52,6 +52,7 @@
+ #include "netutils.h"
+ #include "cache.h"
+ #include "udprelay.h"
++#include "probe.h"
+ #include "winsock.h"
+ #define MAX_UDP_CONN_NUM 256
+ 
+@@ -77,24 +78,6 @@ static server_ctx_t *server_ctx_list[MAX_REMOTE_NUM] = { NULL };
+ 
+ const char *s_port = NULL;
+ 
+-static ev_timer failback_watcher;
+-static int failback_timeout = 300;
+-
+-/* failback: reset all server_ctx preferred idx to 0 periodically */
+-static void
+-failback_cb(EV_P_ ev_timer *w, int revents)
+-{
+-    (void)w; (void)revents;
+-    for (int i = 0; i < server_num; i++) {
+-        server_ctx_t *s_ctx = server_ctx_list[i];
+-        if (s_ctx && s_ctx->preferred_remote_idx > 0) {
+-            LOGI("[udp] failback: resetting preferred_remote_idx for server_ctx %p (%d -> 0)",
+-                 (void*)s_ctx, s_ctx->preferred_remote_idx);
+-            s_ctx->preferred_remote_idx = 0;
+-        }
+-    }
+-}
+-
+ /* Non-blocking helper */
+ static int
+ setnonblocking(int fd)
+@@ -530,7 +513,7 @@ new_remote(int fd, server_ctx_t *server_ctx)
+     ctx->fd         = fd;
+     ctx->server_ctx = server_ctx;
+     ctx->af         = AF_UNSPEC;
+-    ctx->remote_idx = server_ctx ? server_ctx->preferred_remote_idx : 0;
++    ctx->remote_idx = 0; /* Will be set properly when used */
+     ctx->state      = STATE_IDLE;
+ 
+     ev_io_init(&ctx->io, remote_recv_cb, fd, EV_READ);
+@@ -579,9 +562,10 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+ 
+     /* Only perform failover if we were actively awaiting a reply */
+     if (remote_ctx->state == STATE_AWAITING_REPLY) {
+-        if (server_ctx->remote_num > 1 && remote_ctx->remote_idx == server_ctx->preferred_remote_idx) {
+-            server_ctx->preferred_remote_idx = (server_ctx->preferred_remote_idx + 1) % server_ctx->remote_num;
+-            LOGI("[udp] failover on no-reply: switching preferred_remote_idx to %d", server_ctx->preferred_remote_idx);
++        /* Mark the timed-out remote as down */
++        if (remote_ctx->remote_idx < server_ctx->remote_num) {
++            server_ctx->remote_status[remote_ctx->remote_idx] = false;
++            LOGI("[udp] failover on no-reply: remote %d marked as offline.", remote_ctx->remote_idx);
+         }
+     } else {
+         if (verbose) LOGI("[udp] idle session timed out, no failover triggered.");
+@@ -788,10 +772,21 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         if (verbose) LOGI("[udp] cache hit for %s", get_addr_str((struct sockaddr *)&src_addr, true));
+     } else {
+         if (verbose) LOGI("[udp] cache miss for %s, creating remote_ctx", get_addr_str((struct sockaddr *)&src_addr, true));
+-        /* 创建 remote socket，使用 server_ctx->preferred_remote_idx 作为初始 remote */
+-        int preferred_idx = server_ctx->preferred_remote_idx % server_ctx->remote_num;
+-        const struct sockaddr *preferred_remote_addr = server_ctx->remote_addr[preferred_idx];
+-        int prefer_is_v6 = preferred_remote_addr->sa_family == AF_INET6 ? 1 : 0;
++
++        /* Find first available remote */
++        int start_idx = -1;
++        for (int i = 0; i < server_ctx->remote_num; i++) {
++            if (server_ctx->remote_status[i]) {
++                start_idx = i;
++                break;
++            }
++        }
++        if (start_idx == -1) {
++            LOGE("[udp] No remote servers available, dropping packet.");
++            goto CLEAN_UP;
++        }
++        const struct sockaddr *start_remote_addr = server_ctx->remote_addr[start_idx];
++        int prefer_is_v6 = start_remote_addr->sa_family == AF_INET6 ? 1 : 0;
+ 
+         int remotefd = create_remote_socket(prefer_is_v6);
+         if (remotefd < 0) {
+@@ -824,7 +819,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         }
+         remote_ctx->src_addr = src_addr; /* 保存客户端地址 */
+         remote_ctx->af = src_addr.ss_family;
+-        /* remote_idx 已在 new_remote 初始化为 preferred_remote_idx */
++        remote_ctx->remote_idx = start_idx;
+ 
+         /* 插入 cache（cache 应复制 key 内容） */
+         cache_insert(conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
+@@ -833,10 +828,24 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         ev_timer_start(EV_A_ & remote_ctx->watcher);
+     }
+ 
+-    /* 现在 remote_ctx 必定非空（或者已创建），以 remote_ctx->remote_idx 或 server_ctx->preferred_remote_idx 选取 remote_addr */
+-    int use_idx = remote_ctx ? remote_ctx->remote_idx : server_ctx->preferred_remote_idx;
+-    use_idx = use_idx % server_ctx->remote_num;
+-    const struct sockaddr *remote_addr = server_ctx->remote_addr[use_idx];
++    /*
++     * If the remote for this session is now offline, we must failover.
++     * This is an "in-session" failover.
++     */
++    if (!server_ctx->remote_status[remote_ctx->remote_idx]) {
++        int next_idx = -1;
++        for (int i = 0; i < server_ctx->remote_num; i++) {
++            if (server_ctx->remote_status[i]) {
++                next_idx = i;
++                break;
++            }
++        }
++        if (next_idx != -1) {
++            LOGI("[udp] in-session failover for %s: %d -> %d", get_addr_str((struct sockaddr *)&src_addr, true), remote_ctx->remote_idx, next_idx);
++            remote_ctx->remote_idx = next_idx;
++        }
++    }
++    const struct sockaddr *remote_addr = server_ctx->remote_addr[remote_ctx->remote_idx];
+     int remote_addr_len = get_sockaddr_len((struct sockaddr *)remote_addr);
+ 
+     /* 对 payload 进行加密 */
+@@ -855,10 +864,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     if (s == -1) {
+         if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
+             ERROR("[udp] server->sendto to remote failed");
+-            /* 如果 send 失败且不是 EAGAIN，可以考虑立刻触发 failover：把 preferred_remote_idx 推到下一个。 */
++            /* If send fails immediately, mark this remote as down and try to find another one for next time */
+             if (server_ctx->remote_num > 1) {
+-                server_ctx->preferred_remote_idx = (server_ctx->preferred_remote_idx + 1) % server_ctx->remote_num;
+-                LOGI("[udp] sendto failed, failover to remote index %d", server_ctx->preferred_remote_idx);
++                server_ctx->remote_status[remote_ctx->remote_idx] = false;
++                LOGI("[udp] sendto failed, marking remote index %d as offline", remote_ctx->remote_idx);
+ 
+                 /* Remove from cache to force re-creation on next packet */
+                 char key_to_remove[HASH_KEY_LEN];
+@@ -922,20 +931,19 @@ init_udprelay(const char *server_host, const char *server_port, int remote_num,
+     server_ctx->fwmark = fwmark;
+     server_ctx->remote_num = remote_num;
+     server_ctx->remote_addr = remote_addr;
+-    server_ctx->preferred_remote_idx = 0;
++    server_ctx->remote_status = ss_malloc(sizeof(bool) * remote_num);
++    for (int i = 0; i < remote_num; i++) {
++        server_ctx->remote_status[i] = true; /* Assume all are up initially */
++    }
+ 
+     ev_io_start(loop, &server_ctx->io);
+ 
+     if (server_num < MAX_REMOTE_NUM) {
+         server_ctx_list[server_num++] = server_ctx;
+     } else {
+-        LOGE("[udp] too many server_ctx instances");
++        LOGE("[udp] too many server instances");
+     }
+-
+-    ev_timer_init(&failback_watcher, failback_cb, failback_timeout, failback_timeout);
+-    if (remote_num > 1 && !ev_is_active(&failback_watcher))
+-        ev_timer_start(EV_DEFAULT, &failback_watcher);
+-
++    probe_add_udp_server(server_ctx);
+     return serverfd;
+ }
+ 
+@@ -943,12 +951,10 @@ void
+ free_udprelay()
+ {
+     struct ev_loop *loop = EV_DEFAULT;
+-    if (ev_is_active(&failback_watcher))
+-        ev_timer_stop(loop, &failback_watcher);
+-
+     while (server_num > 0) {
+         server_ctx_t *server_ctx = server_ctx_list[--server_num];
+         ev_io_stop(loop, &server_ctx->io);
++        ss_free((void *)server_ctx->remote_status);
+         close(server_ctx->fd);
+         cache_delete(server_ctx->conn_cache, 0);
+         ss_free(server_ctx);
+-- 
+2.37.1 (Apple Git-137.1)
+
