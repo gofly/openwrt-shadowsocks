@@ -1,0 +1,449 @@
+From e3fa2b3d93bb2095b2257ed25b91c937b9bfcfbe Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Tue, 23 Sep 2025 22:11:14 +0800
+Subject: [PATCH 4/4] TCP failover
+
+---
+ src/redir.c | 219 ++++++++++++++++++++++++++++++++++++++--------------
+ src/redir.h |   3 +
+ 2 files changed, 166 insertions(+), 56 deletions(-)
+
+diff --git a/src/redir.c b/src/redir.c
+index 17c5e4e..a38095a 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -87,6 +87,9 @@ static void close_and_free_remote(EV_P_ remote_t *remote);
+ static void free_server(server_t *server);
+ static void close_and_free_server(EV_P_ server_t *server);
+ 
++static void start_connect_remote(EV_P_ server_t *server);
++static void failover_to_next_remote(EV_P_ server_t *server);
++
+ int verbose    = 0;
+ int reuse_port = 0;
+ 
+@@ -108,6 +111,32 @@ static struct ev_signal sigchld_watcher;
+ 
+ static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
+ 
++#define MAX_LISTEN_CTX 32
++static listen_ctx_t *listen_ctx_list[MAX_LISTEN_CTX];
++static int listen_ctx_count = 0;
++
++static ev_timer failback_watcher;
++static int failback_timeout = 300; /* seconds */
++
++static void
++failback_cb(EV_P_ ev_timer *w, int revents)
++{
++    (void)w;
++    (void)revents;
++
++    /* Reset each listener's preferred index back to 0 (first remote) */
++    for (int i = 0; i < listen_ctx_count; i++) {
++        listen_ctx_t *lc = listen_ctx_list[i];
++        if (lc) {
++            if (lc->preferred_remote_idx != 0) {
++                LOGI("failback: resetting listener %p preferred_remote_idx %d -> 0",
++                     (void *)lc, lc->preferred_remote_idx);
++            }
++            lc->preferred_remote_idx = 0;
++        }
++    }
++}
++
+ static int
+ getdestaddr(int fd, struct sockaddr_storage *destaddr)
+ {
+@@ -379,8 +408,12 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+ 
+     ev_timer_stop(EV_A_ watcher);
+ 
+-    close_and_free_remote(EV_A_ remote);
+-    close_and_free_server(EV_A_ server);
++    /* On remote connect/send timeout, try failover (don't immediately
++     * kill the server). The failover function will close the current
++     * remote socket and start connect to next remote in the listener
++     * address list.
++     */
++    failover_to_next_remote(EV_A_ server);
+ }
+ 
+ static void
+@@ -472,11 +505,16 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         if (r == 0) {
+             remote_send_ctx->connected = 1;
+ 
++            /* Connection succeeded — make this listener prefer this remote */
++            if (server->listener) {
++                server->listener->preferred_remote_idx = server->remote_idx;
++            }
++
+             ev_io_stop(EV_A_ & remote_send_ctx->io);
+             ev_io_stop(EV_A_ & server->recv_ctx->io);
+             ev_io_start(EV_A_ & remote->recv_ctx->io);
+ 
+-            // send destaddr
++            /* send destaddr */
+             buffer_t ss_addr_to_send;
+             buffer_t *abuf = &ss_addr_to_send;
+             balloc(abuf, SOCKET_BUF_SIZE);
+@@ -528,8 +566,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         } else {
+             ERROR("getpeername");
+             // not connected
+-            close_and_free_remote(EV_A_ remote);
+-            close_and_free_server(EV_A_ server);
++            failover_to_next_remote(EV_A_ server);
+             return;
+         }
+     }
+@@ -574,8 +611,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+                     } else {
+                         ERROR("fast_open_connect");
+                     }
+-                    close_and_free_remote(EV_A_ remote);
+-                    close_and_free_server(EV_A_ server);
++                    failover_to_next_remote(EV_A_ server);
+                 }
+                 return;
+             }
+@@ -587,19 +623,18 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         if (s == -1) {
+             if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                 ERROR("send");
+-                // close and free
+-                close_and_free_remote(EV_A_ remote);
+-                close_and_free_server(EV_A_ server);
++                /* close current remote and try next */
++                failover_to_next_remote(EV_A_ server);
+             }
+             return;
+         } else if (s < remote->buf->len) {
+-            // partly sent, move memory, wait for the next time to send
++            /* partly sent, move memory, wait for the next time to send */
+             remote->buf->len -= s;
+             remote->buf->idx += s;
+             ev_io_start(EV_A_ & remote_send_ctx->io);
+             return;
+         } else {
+-            // all sent out, wait for reading
++            /* all sent out, wait for reading */
+             remote->buf->len = 0;
+             remote->buf->idx = 0;
+             ev_io_stop(EV_A_ & remote_send_ctx->io);
+@@ -729,49 +764,53 @@ close_and_free_server(EV_P_ server_t *server)
+ }
+ 
+ static void
+-accept_cb(EV_P_ ev_io *w, int revents)
++failover_to_next_remote(EV_P_ server_t *server)
+ {
+-    listen_ctx_t *listener = (listen_ctx_t *)w;
+-    struct sockaddr_storage destaddr;
+-    memset(&destaddr, 0, sizeof(struct sockaddr_storage));
+-
+-    int err;
++    if (server->remote) {
++        close_and_free_remote(EV_A_ server->remote);
++        server->remote = NULL;
++    }
+ 
+-    int serverfd = accept(listener->fd, NULL, NULL);
+-    if (serverfd == -1) {
+-        ERROR("accept");
+-        return;
++    /* advance to next remote index for this server + listener */
++    if (server->listener && server->listener->remote_num > 0) {
++        server->remote_idx = (server->remote_idx + 1) % server->listener->remote_num;
++    } else {
++        server->remote_idx = 0;
+     }
+ 
+-    err = getdestaddr(serverfd, &destaddr);
+-    if (err) {
+-        ERROR("getdestaddr");
++    LOGI("failover: server %p now trying remote_idx %d", (void *)server, server->remote_idx);
++
++    start_connect_remote(EV_A_ server);
++}
++
++static void
++start_connect_remote(EV_P_ server_t *server)
++{
++    listen_ctx_t *listener = server->listener;
++
++    if (server->remote_idx >= listener->remote_num) {
++        LOGE("all remote servers failed to connect");
++        close_and_free_server(EV_A_ server);
+         return;
+     }
+ 
+-    setnonblocking(serverfd);
+-    int opt = 1;
+-    setsockopt(serverfd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+-#ifdef SO_NOSIGPIPE
+-    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+-#endif
+-
+-    int index                    = rand() % listener->remote_num;
+-    struct sockaddr *remote_addr = listener->remote_addr[index];
++    struct sockaddr *remote_addr = listener->remote_addr[server->remote_idx];
+ 
+     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
+     if (remotefd == -1) {
+         ERROR("socket");
++        failover_to_next_remote(EV_A_ server);
+         return;
+     }
+ 
+-    // Set flags
++    int opt = 1;
++    /* Set flags */
+     setsockopt(remotefd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+ #ifdef SO_NOSIGPIPE
+     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+ #endif
+ 
+-    // Enable TCP keepalive feature
++    /* Enable TCP keepalive feature */
+     int keepAlive    = 1;
+     int keepIdle     = 40;
+     int keepInterval = 20;
+@@ -781,7 +820,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     setsockopt(remotefd, SOL_TCP, TCP_KEEPINTVL, (void *)&keepInterval, sizeof(keepInterval));
+     setsockopt(remotefd, SOL_TCP, TCP_KEEPCNT, (void *)&keepCount, sizeof(keepCount));
+ 
+-    // Set non blocking
++    /* Set non blocking */
+     setnonblocking(remotefd);
+ 
+     if (listener->tos >= 0) {
+@@ -795,7 +834,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+         }
+     }
+ 
+-    // Enable MPTCP
++    /* Enable MPTCP if requested */
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+         if (err == -1) {
+@@ -823,14 +862,12 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     }
+ #endif
+ 
+-    server_t *server = new_server(serverfd);
+     remote_t *remote = new_remote(remotefd, listener->timeout);
+     server->remote   = remote;
+     remote->server   = server;
+-    server->destaddr = destaddr;
+ 
+     if (fast_open) {
+-        // save remote addr for fast open
++        /* save remote addr for fast open */
+         remote->addr = remote_addr;
+         ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+     } else {
+@@ -838,17 +875,57 @@ accept_cb(EV_P_ ev_io *w, int revents)
+ 
+         if (r == -1 && errno != CONNECT_IN_PROGRESS) {
+             ERROR("connect");
+-            close_and_free_remote(EV_A_ remote);
+-            close_and_free_server(EV_A_ server);
++            failover_to_next_remote(EV_A_ server);
+             return;
+         }
+-        // listen to remote connected event
++        /* listen to remote connected event */
+         ev_io_start(EV_A_ & remote->send_ctx->io);
+         ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+     }
+     ev_io_start(EV_A_ & server->recv_ctx->io);
+ }
+ 
++static void
++accept_cb(EV_P_ ev_io *w, int revents)
++{
++    listen_ctx_t *listener = (listen_ctx_t *)w;
++    struct sockaddr_storage destaddr;
++    memset(&destaddr, 0, sizeof(struct sockaddr_storage));
++
++    int err;
++
++    int serverfd = accept(listener->fd, NULL, NULL);
++    if (serverfd == -1) {
++        ERROR("accept");
++        return;
++    }
++
++    err = getdestaddr(serverfd, &destaddr);
++    if (err) {
++        ERROR("getdestaddr");
++        return;
++    }
++
++    setnonblocking(serverfd);
++    int opt = 1;
++    setsockopt(serverfd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
++#ifdef SO_NOSIGPIPE
++    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
++#endif
++
++    server_t *server = new_server(serverfd);
++    server->destaddr = destaddr;
++
++    /* associate with listener and initialize remote_idx from listener's preference */
++    server->listener = listener;
++    server->remote_idx = 0;
++    if (listener) {
++        server->remote_idx = listener->preferred_remote_idx;
++    }
++
++    start_connect_remote(EV_A_ server);
++}
++
+ static void
+ signal_cb(EV_P_ ev_signal *w, int revents)
+ {
+@@ -953,7 +1030,7 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_FWMARK:
+             fwmark = atoi(optarg);
+-            LOGE("fwmark is only available on Linux");
++            LOGI("fwmark set to %d", fwmark);
+             break;
+         case GETOPT_VAL_REUSE_PORT:
+             reuse_port = 1;
+@@ -1202,7 +1279,7 @@ main(int argc, char **argv)
+         }
+     }
+ 
+-    // ignore SIGPIPE
++    /* ignore SIGPIPE */
+     signal(SIGPIPE, SIG_IGN);
+     signal(SIGABRT, SIG_IGN);
+ 
+@@ -1213,18 +1290,26 @@ main(int argc, char **argv)
+     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
+ 
+-    // Setup keys
++    /* failback timer: only enable when multiple remotes configured */
++    ev_timer_init(&failback_watcher, failback_cb, failback_timeout, failback_timeout);
++    if (remote_num > 1) {
++        ev_timer_start(EV_DEFAULT, &failback_watcher);
++    }
++
++    /* Setup keys */
+     LOGI("initializing ciphers... %s", method);
+     crypto = crypto_init(password, key, method);
+     if (crypto == NULL)
+         FATAL("failed to initialize ciphers");
+ 
+-    // Setup proxy context
++    /* Setup proxy context */
+     struct listen_ctx listen_ctx;
+     memset(&listen_ctx, 0, sizeof(struct listen_ctx));
+     listen_ctx.remote_num  = remote_num;
+     listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
+     memset(listen_ctx.remote_addr, 0, sizeof(struct sockaddr *) * remote_num);
++    listen_ctx.preferred_remote_idx = 0; /* default prefer first remote */
++
+     for (i = 0; i < remote_num; i++) {
+         char *host = remote_addr[i].host;
+         char *port = remote_addr[i].port == NULL ? remote_port :
+@@ -1248,7 +1333,18 @@ main(int argc, char **argv)
+ 
+     struct ev_loop *loop = EV_DEFAULT;
+ 
++    /* we will possibly create multiple listen_ctx instances (for DSCP),
++     * so iterate and keep pointers in listen_ctx_list.
++     */
+     listen_ctx_t *listen_ctx_current = &listen_ctx;
++
++    /* register first (stack) listen_ctx */
++    if (listen_ctx_count < MAX_LISTEN_CTX) {
++        listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
++    } else {
++        LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
++    }
++
+     do {
+         if (listen_ctx_current->tos) {
+             LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
+@@ -1257,7 +1353,7 @@ main(int argc, char **argv)
+         }
+ 
+         if (mode != UDP_ONLY) {
+-            // Setup socket
++            /* Setup socket */
+             int listenfd;
+             listenfd = create_and_bind(local_addr, local_port);
+             if (listenfd == -1) {
+@@ -1274,7 +1370,7 @@ main(int argc, char **argv)
+             ev_io_start(loop, &listen_ctx_current->io);
+         }
+ 
+-        // Setup UDP
++        /* Setup UDP */
+         if (mode != TCP_ONLY) {
+             LOGI("UDP relay enabled");
+             char *host                       = remote_addr[0].host;
+@@ -1293,16 +1389,27 @@ main(int argc, char **argv)
+             LOGI("TCP relay disabled");
+         }
+ 
+-        // Handle additionals TOS/DSCP listening ports
++        /* Handle additional TOS/DSCP listening ports (if any) */
+         if (dscp_num > 0) {
+-            listen_ctx_current      = (listen_ctx_t *)ss_malloc(sizeof(listen_ctx_t));
+-            listen_ctx_current      = memcpy(listen_ctx_current, &listen_ctx, sizeof(listen_ctx_t));
+-            local_port              = dscp[dscp_num - 1].port;
+-            listen_ctx_current->tos = dscp[dscp_num - 1].dscp << 2;
++            /* allocate new listen_ctx, copy from listen_ctx (stack) and update values */
++            listen_ctx_t *new_lc = (listen_ctx_t *)ss_malloc(sizeof(listen_ctx_t));
++            memcpy(new_lc, &listen_ctx, sizeof(listen_ctx_t));
++            /* set the port and tos for this new listener */
++            local_port = dscp[dscp_num - 1].port;
++            new_lc->tos = dscp[dscp_num - 1].dscp << 2;
++
++            listen_ctx_current = new_lc;
++
++            /* register the newly allocated listener pointer for failback */
++            if (listen_ctx_count < MAX_LISTEN_CTX) {
++                listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
++            } else {
++                LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
++            }
+         }
+     } while (dscp_num-- > 0);
+ 
+-    // setuid
++    /* setuid */
+     if (user != NULL && !run_as(user)) {
+         FATAL("failed to switch user");
+     }
+diff --git a/src/redir.h b/src/redir.h
+index 2544d65..042b631 100644
+--- a/src/redir.h
++++ b/src/redir.h
+@@ -38,6 +38,7 @@ typedef struct listen_ctx {
+     int fd;
+     int mptcp;
+     int tos;
++    int preferred_remote_idx;
+     struct sockaddr **remote_addr;
+ } listen_ctx_t;
+ 
+@@ -60,6 +61,8 @@ typedef struct server {
+ 
+     struct sockaddr_storage destaddr;
+     ev_timer delayed_connect_watcher;
++    int remote_idx;
++    struct listen_ctx *listener;
+ } server_t;
+ 
+ typedef struct remote_ctx {
+-- 
+2.37.1 (Apple Git-137.1)
+
