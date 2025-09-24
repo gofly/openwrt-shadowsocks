@@ -1,25 +1,23 @@
-From 1fde89f074572c4965275ed46381296544e5f13d Mon Sep 17 00:00:00 2001
+From aa55f7f18e281f0bbbae14a280b5a35f2bc71e6d Mon Sep 17 00:00:00 2001
 From: zhenglixin <lixin.zhenglx@gmail.com>
 Date: Mon, 22 Sep 2025 21:38:55 +0800
-Subject: [PATCH 3/9] add fwmark
+Subject: [PATCH 3/8] add fwmark
 
 ---
- src/common.h   |  3 ++-
- src/crypto.c   |  4 ++--
+ src/common.h   |  5 +++--
  src/jconf.c    |  8 ++++++++
  src/jconf.h    |  1 +
- src/netutils.c |  2 +-
  src/redir.c    | 20 +++++++++++++++++++-
- src/udprelay.c | 14 ++++++++++++--
+ src/udprelay.c | 12 +++++++++++-
  src/udprelay.h |  1 +
- src/utils.c    |  2 --
- 9 files changed, 46 insertions(+), 9 deletions(-)
+ src/utils.c    |  2 ++
+ 7 files changed, 45 insertions(+), 4 deletions(-)
 
 diff --git a/src/common.h b/src/common.h
-index 8a934f7..68c78f4 100644
+index d642fd0..d45d773 100644
 --- a/src/common.h
 +++ b/src/common.h
-@@ -34,7 +34,7 @@
+@@ -30,7 +30,7 @@
  
  int init_udprelay(const char *server_host, const char *server_port,
                    const struct sockaddr *remote_addr, const int remote_addr_len,
@@ -28,38 +26,18 @@ index 8a934f7..68c78f4 100644
  
  void free_udprelay(void);
  
-@@ -57,6 +57,7 @@ enum {
-     GETOPT_VAL_PLUGIN_OPTS,
-     GETOPT_VAL_PASSWORD,
-     GETOPT_VAL_KEY,
+@@ -56,7 +56,8 @@ enum {
+     GETOPT_VAL_TCP_INCOMING_SNDBUF,
+     GETOPT_VAL_TCP_INCOMING_RCVBUF,
+     GETOPT_VAL_TCP_OUTGOING_SNDBUF,
+-    GETOPT_VAL_TCP_OUTGOING_RCVBUF
++    GETOPT_VAL_TCP_OUTGOING_RCVBUF,
 +    GETOPT_VAL_FWMARK,
  };
  
  #endif // _COMMON_H
-diff --git a/src/crypto.c b/src/crypto.c
-index 76c426b..2795f93 100644
---- a/src/crypto.c
-+++ b/src/crypto.c
-@@ -24,7 +24,7 @@
- #include "config.h"
- #endif
- 
--#if defined(__linux__) && defined(HAVE_LINUX_RANDOM_H)
-+#if defined(HAVE_LINUX_RANDOM_H)
- #include <fcntl.h>
- #include <unistd.h>
- #include <sys/ioctl.h>
-@@ -115,7 +115,7 @@ crypto_md5(const unsigned char *d, size_t n, unsigned char *md)
- static void
- entropy_check(void)
- {
--#if defined(__linux__) && defined(HAVE_LINUX_RANDOM_H) && defined(RNDGETENTCNT)
-+#if defined(HAVE_LINUX_RANDOM_H) && defined(RNDGETENTCNT)
-     int fd;
-     int c;
- 
 diff --git a/src/jconf.c b/src/jconf.c
-index 5adba34..66fb7ea 100644
+index d2815ef..e72bc8b 100644
 --- a/src/jconf.c
 +++ b/src/jconf.c
 @@ -155,6 +155,9 @@ parse_dscp(char *str)
@@ -72,7 +50,7 @@ index 5adba34..66fb7ea 100644
      static jconf_t conf;
  
      memset(&conf, 0, sizeof(jconf_t));
-@@ -347,6 +350,11 @@ read_jconf(const char *file)
+@@ -363,6 +366,11 @@ read_jconf(const char *file)
                  conf.tcp_tproxy = value->u.boolean;
              } else if (strcmp(name, "workdir") == 0) {
                  conf.workdir = to_string(value);
@@ -85,10 +63,10 @@ index 5adba34..66fb7ea 100644
                  conf.acl = to_string(value);
              } else if (strcmp(name, "manager_address") == 0) {
 diff --git a/src/jconf.h b/src/jconf.h
-index 4bf7f5e..df7d0f3 100644
+index 544011d..1955536 100644
 --- a/src/jconf.h
 +++ b/src/jconf.h
-@@ -86,6 +86,7 @@ typedef struct {
+@@ -90,6 +90,7 @@ typedef struct {
      char *workdir;
      char *acl;
      char *manager_address;
@@ -96,24 +74,11 @@ index 4bf7f5e..df7d0f3 100644
  } jconf_t;
  
  jconf_t *read_jconf(const char *file);
-diff --git a/src/netutils.c b/src/netutils.c
-index 5e09d5b..7b32805 100644
---- a/src/netutils.c
-+++ b/src/netutils.c
-@@ -33,7 +33,7 @@
- #include <netinet/in.h>
- #include <unistd.h>
- 
--#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
-+#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H)
- #include <net/if.h>
- #include <sys/ioctl.h>
- #define SET_INTERFACE
 diff --git a/src/redir.c b/src/redir.c
-index 0c33d76..17c5e4e 100644
+index d36fe3f..069ac22 100644
 --- a/src/redir.c
 +++ b/src/redir.c
-@@ -99,6 +99,7 @@ static int nofile = 0;
+@@ -103,6 +103,7 @@ static int nofile = 0;
  #endif
  int fast_open       = 0;
  static int no_delay = 0;
@@ -121,8 +86,8 @@ index 0c33d76..17c5e4e 100644
  static int ret_val  = 0;
  
  static struct ev_signal sigint_watcher;
-@@ -814,6 +815,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
-         }
+@@ -840,6 +841,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
+         setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
      }
  
 +#ifdef SO_MARK
@@ -136,7 +101,7 @@ index 0c33d76..17c5e4e 100644
      server_t *server = new_server(serverfd);
      remote_t *remote = new_remote(remotefd, listener->timeout);
      server->remote   = remote;
-@@ -906,6 +915,7 @@ main(int argc, char **argv)
+@@ -936,6 +945,7 @@ main(int argc, char **argv)
          { "no-delay",    no_argument,       NULL, GETOPT_VAL_NODELAY     },
          { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
          { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
@@ -144,7 +109,7 @@ index 0c33d76..17c5e4e 100644
          { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
          { NULL,          0,                 NULL, 0                      }
      };
-@@ -941,6 +951,10 @@ main(int argc, char **argv)
+@@ -972,6 +982,10 @@ main(int argc, char **argv)
          case GETOPT_VAL_KEY:
              key = optarg;
              break;
@@ -155,7 +120,7 @@ index 0c33d76..17c5e4e 100644
          case GETOPT_VAL_REUSE_PORT:
              reuse_port = 1;
              break;
-@@ -1092,6 +1106,10 @@ main(int argc, char **argv)
+@@ -1147,6 +1161,10 @@ main(int argc, char **argv)
          }
          dscp_num = conf->dscp_num;
          dscp     = conf->dscp;
@@ -166,7 +131,7 @@ index 0c33d76..17c5e4e 100644
      }
  
      if (remote_num == 0 || remote_port == NULL || local_port == NULL
-@@ -1268,7 +1286,7 @@ main(int argc, char **argv)
+@@ -1355,7 +1373,7 @@ main(int argc, char **argv)
              }
              struct sockaddr *addr = (struct sockaddr *)storage;
              init_udprelay(local_addr, local_port, addr,
@@ -176,19 +141,10 @@ index 0c33d76..17c5e4e 100644
  
          if (mode == UDP_ONLY) {
 diff --git a/src/udprelay.c b/src/udprelay.c
-index b91dbed..eed7081 100644
+index 578e024..b786e13 100644
 --- a/src/udprelay.c
 +++ b/src/udprelay.c
-@@ -40,7 +40,7 @@
- #include "config.h"
- #endif
- 
--#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
-+#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H)
- #include <net/if.h>
- #include <sys/ioctl.h>
- #define SET_INTERFACE
-@@ -963,6 +963,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+@@ -852,6 +852,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
          }
          setnonblocking(remotefd);
  
@@ -204,7 +160,7 @@ index b91dbed..eed7081 100644
  #ifdef SO_NOSIGPIPE
          set_nosigpipe(remotefd);
  #endif
-@@ -1042,7 +1051,7 @@ free_cb(void *key, void *element)
+@@ -932,7 +941,7 @@ free_cb(void *key, void *element)
  int
  init_udprelay(const char *server_host, const char *server_port,
                const struct sockaddr *remote_addr, const int remote_addr_len,
@@ -213,7 +169,7 @@ index b91dbed..eed7081 100644
  {
      s_port = server_port;
      // Initialize ev loop
-@@ -1073,6 +1082,7 @@ init_udprelay(const char *server_host, const char *server_port,
+@@ -963,6 +972,7 @@ init_udprelay(const char *server_host, const char *server_port,
      server_ctx->crypto     = crypto;
      server_ctx->iface      = iface;
      server_ctx->conn_cache = conn_cache;
@@ -222,32 +178,30 @@ index b91dbed..eed7081 100644
      server_ctx->remote_addr_len = remote_addr_len;
  
 diff --git a/src/udprelay.h b/src/udprelay.h
-index 7242491..b2baf01 100644
+index 132c9cc..8f071dc 100644
 --- a/src/udprelay.h
 +++ b/src/udprelay.h
-@@ -65,6 +65,7 @@ typedef struct server_ctx {
- #ifdef MODULE_REMOTE
-     struct ev_loop *loop;
- #endif
+@@ -53,6 +53,7 @@ typedef struct server_ctx {
+     struct cache *conn_cache;
+     const struct sockaddr *remote_addr;
+     int remote_addr_len;
 +    int fwmark;
  } server_ctx_t;
  
- #ifdef MODULE_REMOTE
+ typedef struct remote_ctx {
 diff --git a/src/utils.c b/src/utils.c
-index 4eb601b..d4186a8 100644
+index 553e1ac..ff4a16b 100644
 --- a/src/utils.c
 +++ b/src/utils.c
-@@ -354,10 +354,8 @@ usage()
-         "                                  with Linux kernel > 3.7.0.\n");
+@@ -362,6 +362,8 @@ usage()
+         "       [--plugin <name>]          Enable SIP003 plugin. (Experimental)\n");
      printf(
-         "       [--mtu <MTU>]              MTU of your network interface.\n");
--#ifdef __linux__
+         "       [--plugin-opts <options>]  Set SIP003 plugin options. (Experimental)\n");
++    printf(
++        "       [--fwmark <mark>]          Set firewall mark for outgoing packets.\n");
+     printf("\n");
      printf(
-         "       [--mptcp]                  Enable Multipath TCP on MPTCP Kernel.\n");
--#endif
-     printf(
-         "       [--no-delay]               Enable TCP_NODELAY.\n");
-     printf(
+         "       [-v]                       Verbose mode.\n");
 -- 
 2.37.1 (Apple Git-137.1)
 

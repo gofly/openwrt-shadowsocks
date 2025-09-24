@@ -10,6 +10,12 @@ config servers main
 	option fast_open '1'
 	option no_delay '1'
 	option fwmark '255'
+	option probe_interval '30'
+	option probe_timeout '5'
+	option probe_up_count '1'
+	option probe_down_count '3'
+	option probe_domain 'www.google.com'
+	option metrics_port '9105'
 
 config redir
 	option main_server main

@@ -1,37 +1,40 @@
-From 6b31c26f0ab88ad2b6c3c9d8498bd9cf36a1a70b Mon Sep 17 00:00:00 2001
+From 7ef3f48d8b3012e60b07432a8384e3f313e2dd33 Mon Sep 17 00:00:00 2001
 From: zhenglixin <lixin.zhenglx@gmail.com>
 Date: Tue, 23 Sep 2025 03:07:09 +0800
-Subject: [PATCH 2/9] simple
+Subject: [PATCH 2/8] remove ss-local/ss-server/ss-tunnel
 
 ---
  README.md           |   35 +-
  doc/CMakeLists.txt  |   12 +-
  snap/snapcraft.yaml |   28 +-
- src/CMakeLists.txt  |  140 +--
- src/Makefile.am     |   76 +-
- src/acl.c           |  355 --------
+ src/CMakeLists.txt  |  144 +--
+ src/Makefile.am     |   78 +-
+ src/acl.c           |  355 -------
  src/acl.h           |   40 -
  src/android.c       |  138 ---
- src/common.h        |   16 +-
- src/local.c         | 2110 ------------------------------------------
- src/local.h         |  104 ---
- src/manager.c       | 1282 --------------------------
+ src/common.h        |   21 +-
+ src/crypto.c        |    8 +-
+ src/local.c         | 2195 --------------------------------------
+ src/local.h         |  104 --
+ src/manager.c       | 1292 -----------------------
  src/manager.h       |   80 --
- src/netutils.c      |    6 -
+ src/netutils.c      |    8 +-
  src/plugin.c        |   31 -
  src/plugin.h        |    3 -
- src/resolv.c        |  497 ----------
+ src/resolv.c        |  497 ---------
  src/resolv.h        |   46 -
  src/rule.c          |  133 ---
  src/rule.h          |   58 --
- src/server.c        | 2120 -------------------------------------------
+ src/server.c        | 2428 -------------------------------------------
  src/server.h        |  121 ---
  src/socks5.h        |   75 --
- src/tunnel.c        | 1359 ---------------------------
+ src/stream.c        |    7 -
+ src/tunnel.c        | 1449 --------------------------
  src/tunnel.h        |   91 --
- src/udprelay.c      |  366 +-------
- src/utils.c         |   59 --
- 27 files changed, 13 insertions(+), 9368 deletions(-)
+ src/udprelay.c      |  529 +---------
+ src/udprelay.h      |   26 -
+ src/utils.c         |   77 --
+ 30 files changed, 18 insertions(+), 10091 deletions(-)
  delete mode 100644 src/acl.c
  delete mode 100644 src/acl.h
  delete mode 100644 src/android.c
@@ -50,10 +53,10 @@ Subject: [PATCH 2/9] simple
  delete mode 100644 src/tunnel.h
 
 diff --git a/README.md b/README.md
-index 1ca7852..fc1a633 100644
+index 8a874db..6741250 100644
 --- a/README.md
 +++ b/README.md
-@@ -349,10 +349,7 @@ More information about the image can be found [here](docker/alpine/README.md).
+@@ -357,10 +357,7 @@ More information about the image can be found [here](docker/alpine/README.md).
  For a detailed and complete list of all supported arguments,
  you may refer to the man pages of the applications, respectively.
  
@@ -65,7 +68,7 @@ index 1ca7852..fc1a633 100644
         -p <server_port>           Port number of your remote server.
  
         -l <local_port>            Port number of your local server.
-@@ -380,17 +377,7 @@ you may refer to the man pages of the applications, respectively.
+@@ -388,17 +385,7 @@ you may refer to the man pages of the applications, respectively.
  
         [-n <number>]              Max number of open files.
  
@@ -83,7 +86,7 @@ index 1ca7852..fc1a633 100644
  
         [-u]                       Enable UDP relay.
                                    (TPROXY is required in redir mode)
-@@ -401,26 +388,12 @@ you may refer to the man pages of the applications, respectively.
+@@ -409,26 +396,12 @@ you may refer to the man pages of the applications, respectively.
         [-T]                       Use tproxy instead of redirect. (for tcp)
                                    (only available in redir mode)
  
@@ -110,7 +113,7 @@ index 1ca7852..fc1a633 100644
  
         [--mtu <MTU>]              MTU of your network interface.
  
-@@ -428,12 +401,6 @@ you may refer to the man pages of the applications, respectively.
+@@ -436,12 +409,6 @@ you may refer to the man pages of the applications, respectively.
  
         [--no-delay]               Enable TCP_NODELAY.
  
@@ -210,7 +213,7 @@ index 49b687f..776fa1e 100644
      source: https://github.com/shadowsocks/shadowsocks-libev/releases/download/v3.3.5/shadowsocks-libev-3.3.5.tar.gz
      build-packages:
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 346ba07..9bb8caf 100644
+index 9ca9d85..65f44fb 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -1,29 +1,19 @@
@@ -318,7 +321,7 @@ index 346ba07..9bb8caf 100644
          )
 -
 -if (MINGW)
--list(APPEND DEPS ws2_32)
+-list(APPEND DEPS ws2_32 iphlpapi)
 -add_compile_definitions(CARES_STATICLIB PCRE_STATIC)
 -endif ()
  endif ()
@@ -349,7 +352,7 @@ index 346ba07..9bb8caf 100644
 -target_compile_definitions(ss-tunnel PUBLIC -DMODULE_TUNNEL)
 -target_compile_definitions(ss-manager PUBLIC -DMODULE_MANAGER)
 -target_compile_definitions(ss-local PUBLIC -DMODULE_LOCAL)
- target_compile_definitions(ss-redir PUBLIC -DMODULE_REDIR)
+-target_compile_definitions(ss-redir PUBLIC -DMODULE_REDIR)
 -target_compile_definitions(shadowsocks-libev PUBLIC -DMODULE_LOCAL -DLIB_ONLY)
 -
 -target_include_directories(shadowsocks-libev PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -358,6 +361,7 @@ index 346ba07..9bb8caf 100644
 -target_link_libraries(ss-tunnel cork ${DEPS})
 -target_link_libraries(ss-manager m bloom cork ${LIBEV} ${LIBUDNS})
 -target_link_libraries(ss-local cork ipset ${DEPS})
++target_compile_definitions(ss-redir PUBLIC)
  target_link_libraries(ss-redir cork ipset ${DEPS})
 -target_link_libraries(shadowsocks-libev cork ipset ${DEPS})
  endif ()
@@ -386,7 +390,7 @@ index 346ba07..9bb8caf 100644
 -target_compile_definitions(ss-tunnel-shared PUBLIC -DMODULE_TUNNEL)
 -target_compile_definitions(ss-manager-shared PUBLIC -DMODULE_MANAGER)
 -target_compile_definitions(ss-local-shared PUBLIC -DMODULE_LOCAL)
- target_compile_definitions(ss-redir-shared PUBLIC -DMODULE_REDIR)
+-target_compile_definitions(ss-redir-shared PUBLIC -DMODULE_REDIR)
 -target_compile_definitions(shadowsocks-libev-shared PUBLIC -DMODULE_LOCAL -DLIB_ONLY)
 -
 -target_include_directories(shadowsocks-libev-shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -395,6 +399,7 @@ index 346ba07..9bb8caf 100644
 -target_link_libraries(ss-tunnel-shared ${DEPS_SHARED})
 -target_link_libraries(ss-manager-shared ${CMAKE_THREAD_LIBS_INIT} ${LIBEV_SHARED} ${LIBUDNS_SHARED} ${DEPS_SHARED})
 -target_link_libraries(ss-local-shared ${DEPS_SHARED})
++target_compile_definitions(ss-redir-shared PUBLIC)
  target_link_libraries(ss-redir-shared ${DEPS_SHARED})
 -target_link_libraries(shadowsocks-libev-shared ${DEPS_SHARED})
 -
@@ -435,7 +440,7 @@ index 346ba07..9bb8caf 100644
  add_custom_target(distclean
          COMMAND ${CMAKE_COMMAND} -E echo WARNING: distclean target is not functional
 diff --git a/src/Makefile.am b/src/Makefile.am
-index c261ed0..812002c 100644
+index c255b60..995f1cd 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
 @@ -19,14 +19,6 @@ SS_COMMON_LIBS += -lbloom -lcork -lcorkipset
@@ -513,8 +518,12 @@ index c261ed0..812002c 100644
  ss_redir_SOURCES = utils.c \
                     jconf.c \
                     json.c \
-@@ -100,16 +41,7 @@ ss_redir_SOURCES = utils.c \
- ss_redir_CFLAGS = $(AM_CFLAGS) -DMODULE_REDIR
+@@ -97,19 +38,10 @@ ss_redir_SOURCES = utils.c \
+                    $(crypto_src) \
+                    $(plugin_src)
+ 
+-ss_redir_CFLAGS = $(AM_CFLAGS) -DMODULE_REDIR
++ss_redir_CFLAGS = $(AM_CFLAGS)
  ss_redir_LDADD = $(SS_COMMON_LIBS)
  ss_redir_LDADD += -lcares
 -endif
@@ -1085,18 +1094,17 @@ index 5b6db3d..0000000
 -    return 0;
 -}
 diff --git a/src/common.h b/src/common.h
-index 14f1d8d..8a934f7 100644
+index 66e985c..d642fd0 100644
 --- a/src/common.h
 +++ b/src/common.h
-@@ -26,28 +26,18 @@
+@@ -26,28 +26,14 @@
  #define SOL_TCP IPPROTO_TCP
  #endif
  
 -#if defined(MODULE_TUNNEL) || defined(MODULE_REDIR)
-+#if defined(MODULE_REDIR)
- #define MODULE_LOCAL
- #endif
- 
+-#define MODULE_LOCAL
+-#endif
+-
  #include "crypto.h"
  
  int init_udprelay(const char *server_host, const char *server_port,
@@ -1118,7 +1126,7 @@ index 14f1d8d..8a934f7 100644
  #define STAGE_ERROR     -1  /* Error detected                   */
  #define STAGE_INIT       0  /* Initial stage                    */
  #define STAGE_HANDSHAKE  1  /* Handshake with client            */
-@@ -61,16 +51,12 @@ enum {
+@@ -61,21 +47,16 @@ enum {
      GETOPT_VAL_REUSE_PORT,
      GETOPT_VAL_FAST_OPEN,
      GETOPT_VAL_NODELAY,
@@ -1132,15 +1140,55 @@ index 14f1d8d..8a934f7 100644
 -    GETOPT_VAL_MANAGER_ADDRESS,
 -    GETOPT_VAL_EXECUTABLE,
 -    GETOPT_VAL_WORKDIR,
+     GETOPT_VAL_TCP_INCOMING_SNDBUF,
+     GETOPT_VAL_TCP_INCOMING_RCVBUF,
+     GETOPT_VAL_TCP_OUTGOING_SNDBUF,
+-    GETOPT_VAL_TCP_OUTGOING_RCVBUF,
+-    GETOPT_VAL_NFTABLES_SETS
++    GETOPT_VAL_TCP_OUTGOING_RCVBUF
  };
  
  #endif // _COMMON_H
+diff --git a/src/crypto.c b/src/crypto.c
+index 76c426b..d8a554e 100644
+--- a/src/crypto.c
++++ b/src/crypto.c
+@@ -24,7 +24,7 @@
+ #include "config.h"
+ #endif
+ 
+-#if defined(__linux__) && defined(HAVE_LINUX_RANDOM_H)
++#if defined(HAVE_LINUX_RANDOM_H)
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
+@@ -115,7 +115,7 @@ crypto_md5(const unsigned char *d, size_t n, unsigned char *md)
+ static void
+ entropy_check(void)
+ {
+-#if defined(__linux__) && defined(HAVE_LINUX_RANDOM_H) && defined(RNDGETENTCNT)
++#if defined(HAVE_LINUX_RANDOM_H) && defined(RNDGETENTCNT)
+     int fd;
+     int c;
+ 
+@@ -143,11 +143,7 @@ crypto_init(const char *password, const char *key, const char *method)
+     }
+ 
+     // Initialize NONCE bloom filter
+-#ifdef MODULE_REMOTE
+-    ppbloom_init(BF_NUM_ENTRIES_FOR_SERVER, BF_ERROR_RATE_FOR_SERVER);
+-#else
+     ppbloom_init(BF_NUM_ENTRIES_FOR_CLIENT, BF_ERROR_RATE_FOR_CLIENT);
+-#endif
+ 
+     if (method != NULL) {
+         for (i = 0; i < STREAM_CIPHER_NUM; i++)
 diff --git a/src/local.c b/src/local.c
 deleted file mode 100644
-index de19a1d..0000000
+index fa1ca7b..0000000
 --- a/src/local.c
 +++ /dev/null
-@@ -1,2110 +0,0 @@
+@@ -1,2195 +0,0 @@
 -/*
 - * local.c - Setup a socks5 proxy through remote shadowsocks server
 - *
@@ -1222,6 +1270,10 @@ index de19a1d..0000000
 -
 -int verbose    = 0;
 -int reuse_port = 0;
+-int tcp_incoming_sndbuf = 0;
+-int tcp_incoming_rcvbuf = 0;
+-int tcp_outgoing_sndbuf = 0;
+-int tcp_outgoing_rcvbuf = 0;
 -
 -#ifdef __ANDROID__
 -int vpn        = 0;
@@ -1307,7 +1359,7 @@ index de19a1d..0000000
 -{
 -    struct addrinfo hints;
 -    struct addrinfo *result, *rp;
--    int s, listen_sock;
+-    int s, listen_sock = -1;
 -
 -    memset(&hints, 0, sizeof(struct addrinfo));
 -    hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
@@ -2411,8 +2463,11 @@ index de19a1d..0000000
 -        remote_addr = addr;
 -    }
 -
--    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
--
+-    int protocol = IPPROTO_TCP;
+-    if (listener->mptcp < 0) {
+-        protocol = IPPROTO_MPTCP; // Enable upstream MPTCP
+-    }
+-    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
 -    if (remotefd == -1) {
 -        ERROR("socket");
 -        return NULL;
@@ -2424,10 +2479,11 @@ index de19a1d..0000000
 -    setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
 -
+-    // Enable out-of-tree MPTCP
 -    if (listener->mptcp > 1) {
 -        int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
 -        if (err == -1) {
--            ERROR("failed to enable multipath TCP");
+-            ERROR("failed to enable out-of-tree multipath TCP");
 -        }
 -    } else if (listener->mptcp == 1) {
 -        int i = 0;
@@ -2439,8 +2495,16 @@ index de19a1d..0000000
 -            i++;
 -        }
 -        if (listener->mptcp == 0) {
--            ERROR("failed to enable multipath TCP");
+-            ERROR("failed to enable out-of-tree multipath TCP");
 -        }
+-    }
+-
+-    if (tcp_outgoing_sndbuf > 0) {
+-        setsockopt(remotefd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_outgoing_rcvbuf > 0) {
+-        setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
 -    }
 -
 -    // Setup
@@ -2533,6 +2597,14 @@ index de19a1d..0000000
 -    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
 -
+-    if (tcp_incoming_sndbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_incoming_rcvbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+-    }
+-
 -    server_t *server = new_server(serverfd);
 -    server->listener = listener;
 -
@@ -2573,6 +2645,10 @@ index de19a1d..0000000
 -
 -    static struct option long_options[] = {
 -        { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+-        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+-        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+-        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+-        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
 -        { "fast-open",   no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
 -        { "no-delay",    no_argument,       NULL, GETOPT_VAL_NODELAY     },
 -        { "acl",         required_argument, NULL, GETOPT_VAL_ACL         },
@@ -2610,8 +2686,9 @@ index de19a1d..0000000
 -            LOGI("set MTU to %d", mtu);
 -            break;
 -        case GETOPT_VAL_MPTCP:
--            mptcp = 1;
--            LOGI("enable multipath TCP");
+-            mptcp = get_mptcp(1);
+-            if (mptcp)
+-                LOGI("enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
 -            break;
 -        case GETOPT_VAL_NODELAY:
 -            no_delay = 1;
@@ -2628,6 +2705,18 @@ index de19a1d..0000000
 -            break;
 -        case GETOPT_VAL_REUSE_PORT:
 -            reuse_port = 1;
+-            break;
+-        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+-            tcp_incoming_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+-            tcp_incoming_rcvbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+-            tcp_outgoing_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+-            tcp_outgoing_rcvbuf = atoi(optarg);
 -            break;
 -        case 's':
 -            if (remote_num < MAX_REMOTE_NUM) {
@@ -2756,6 +2845,18 @@ index de19a1d..0000000
 -        if (reuse_port == 0) {
 -            reuse_port = conf->reuse_port;
 -        }
+-        if (tcp_incoming_sndbuf == 0) {
+-            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+-        }
+-        if (tcp_incoming_rcvbuf == 0) {
+-            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+-        }
+-        if (tcp_outgoing_sndbuf == 0) {
+-            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+-        }
+-        if (tcp_outgoing_rcvbuf == 0) {
+-            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
+-        }
 -        if (fast_open == 0) {
 -            fast_open = conf->fast_open;
 -        }
@@ -2807,6 +2908,38 @@ index de19a1d..0000000
 -#ifdef __MINGW32__
 -    winsock_init();
 -#endif
+-
+-    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_sndbuf = 0;
+-    }
+-
+-    if (tcp_incoming_sndbuf != 0) {
+-        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_rcvbuf = 0;
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0) {
+-        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_sndbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0) {
+-        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_rcvbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0) {
+-        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
+-    }
 -
 -    if (plugin != NULL) {
 -        uint16_t port = get_local_port();
@@ -3363,10 +3496,10 @@ index 96ee92a..0000000
 -#endif // _LOCAL_H
 diff --git a/src/manager.c b/src/manager.c
 deleted file mode 100644
-index fd3c645..0000000
+index 8a229d0..0000000
 --- a/src/manager.c
 +++ /dev/null
-@@ -1,1282 +0,0 @@
+@@ -1,1292 +0,0 @@
 -/*
 - * server.c - Provide shadowsocks service
 - *
@@ -3554,6 +3687,10 @@ index fd3c645..0000000
 -    if (server->mode == NULL && manager->mode == TCP_AND_UDP) {
 -        int len = strlen(cmd);
 -        snprintf(cmd + len, BUF_SIZE - len, " -u");
+-    }
+-    if (manager->iface) {
+-        int len = strlen(cmd);
+-        snprintf(cmd + len, BUF_SIZE - len, " -i \"%s\"", manager->iface);
 -    }
 -    if (server->fast_open[0] == 0 && manager->fast_open) {
 -        int len = strlen(cmd);
@@ -3807,7 +3944,7 @@ index fd3c645..0000000
 -        }
 -    }
 -
--    if (!result) {
+-    if (result != NULL) {
 -        freeaddrinfo(result);
 -    }
 -
@@ -3978,6 +4115,9 @@ index fd3c645..0000000
 -        LOGE("too large request: %d", (int)r);
 -        return;
 -    }
+-
+-    // properly terminate string which recvfrom does not do
+-    buf[r] = '\0';
 -
 -    char *action = get_action(buf, r);
 -    if (action == NULL) {
@@ -4202,12 +4342,14 @@ index fd3c645..0000000
 -        close(server_sock);
 -    }
 -
+-    if (result != NULL) {
+-        freeaddrinfo(result);
+-    }
+-
 -    if (rp == NULL) {
 -        LOGE("cannot bind");
 -        return -1;
 -    }
--
--    freeaddrinfo(result);
 -
 -    return server_sock;
 -}
@@ -4483,7 +4625,7 @@ index fd3c645..0000000
 -    if (workdir == NULL || strlen(workdir) == 0) {
 -        workdir = pw->pw_dir;
 -        // If home dir is still not defined or set to nologin/nonexistent, fall back to /tmp
--        if (strstr(workdir, "nologin") || strstr(workdir, "nonexistent") || workdir == NULL || strlen(workdir) == 0) {
+-        if (workdir == NULL || strlen(workdir) == 0 || strstr(workdir, "nologin") || strstr(workdir, "nonexistent")) {
 -            workdir = "/tmp";
 -        }
 -
@@ -4646,6 +4788,7 @@ index fd3c645..0000000
 -    ev_signal_stop(EV_DEFAULT, &sigint_watcher);
 -    ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
 -    ss_free(working_dir);
+-    free_addr(&ip_addr);
 -
 -    return 0;
 -}
@@ -4736,10 +4879,10 @@ index d5aa832..0000000
 -
 -#endif // _MANAGER_H
 diff --git a/src/netutils.c b/src/netutils.c
-index 8c7329a..5e09d5b 100644
+index 8c7329a..7b32805 100644
 --- a/src/netutils.c
 +++ b/src/netutils.c
-@@ -28,12 +28,10 @@
+@@ -28,14 +28,12 @@
  #include "config.h"
  #endif
  
@@ -4750,8 +4893,11 @@ index 8c7329a..5e09d5b 100644
  #include <unistd.h>
 -#endif
  
- #if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
+-#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
++#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H)
  #include <net/if.h>
+ #include <sys/ioctl.h>
+ #define SET_INTERFACE
 @@ -149,10 +147,6 @@ get_sockaddr(char *host, char *port,
          }
          return 0;
@@ -4764,7 +4910,7 @@ index 8c7329a..5e09d5b 100644
          struct addrinfo *result, *rp;
  
 diff --git a/src/plugin.c b/src/plugin.c
-index 48c614c..5c14ff6 100644
+index b67a9a4..4dba96c 100644
 --- a/src/plugin.c
 +++ b/src/plugin.c
 @@ -25,12 +25,10 @@
@@ -4869,7 +5015,7 @@ index 48c614c..5c14ff6 100644
      env = NULL;
      return ret;
  }
-@@ -332,11 +303,9 @@ stop_plugin()
+@@ -334,11 +305,9 @@ stop_plugin()
  {
      if (sub != NULL) {
          cork_subprocess_abort(sub);
@@ -5655,10 +5801,10 @@ index 015bc42..0000000
 -#endif
 diff --git a/src/server.c b/src/server.c
 deleted file mode 100644
-index c52dfa1..0000000
+index 73b6599..0000000
 --- a/src/server.c
 +++ /dev/null
-@@ -1,2120 +0,0 @@
+@@ -1,2428 +0,0 @@
 -/*
 - * server.c - Provide shadowsocks service
 - *
@@ -5712,6 +5858,20 @@ index c52dfa1..0000000
 -#define SET_INTERFACE
 -#endif
 -
+-#ifdef USE_NFTABLES
+-#include <ctype.h>
+-#include <linux/netfilter.h>
+-#include <linux/netfilter/nf_tables.h>
+-#include <libmnl/libmnl.h>
+-#include <libnftnl/set.h>
+-/* the datatypes enum is picked from libnftables/datatype.h
+-   to avoid to depend libnftables */
+-enum datatypes {
+-    TYPE_IPADDR = 7,
+-    TYPE_IP6ADDR
+-};
+-#endif
+-
 -#include "netutils.h"
 -#include "utils.h"
 -#include "acl.h"
@@ -5730,10 +5890,6 @@ index c52dfa1..0000000
 -
 -#ifndef SSMAXCONN
 -#define SSMAXCONN 1024
--#endif
--
--#ifndef MAX_FRAG
--#define MAX_FRAG 1
 -#endif
 -
 -#ifdef USE_NFCONNTRACK_TOS
@@ -5770,6 +5926,10 @@ index c52dfa1..0000000
 -
 -int verbose    = 0;
 -int reuse_port = 0;
+-int tcp_incoming_sndbuf = 0;
+-int tcp_incoming_rcvbuf = 0;
+-int tcp_outgoing_sndbuf = 0;
+-int tcp_outgoing_rcvbuf = 0;
 -
 -int is_bind_local_addr = 0;
 -struct sockaddr_storage local_addr_v4;
@@ -5935,6 +6095,207 @@ index c52dfa1..0000000
 -    server->stage = STAGE_STOP;
 -}
 -
+-#ifdef USE_NFTABLES
+-struct nftbl_set_info {
+-    uint32_t family;
+-    char *table;
+-    char *name;
+-    uint32_t type;
+-}* nftbl_badip_sets[16];
+-
+-static struct nftnl_set *
+-nftbl_build_set(const char* table, const char* name, void* addr, size_t len)
+-{
+-    struct nftnl_set *set = nftnl_set_alloc();
+-    if (set == NULL) return NULL;
+-    nftnl_set_set_str(set, NFTNL_SET_TABLE, table);
+-    nftnl_set_set_str(set, NFTNL_SET_NAME, name);
+-
+-    struct nftnl_set_elem *elem = nftnl_set_elem_alloc();
+-    if (elem == NULL) {
+-        nftnl_set_free(set);
+-        return NULL;
+-    }
+-    nftnl_set_elem_set(elem, NFTNL_SET_ELEM_KEY, addr, len);
+-    nftnl_set_elem_add(set, elem);
+-    return set;
+-}
+-
+-static uint32_t
+-nftbl_build_nlmsg(void* buf, size_t *len, uint32_t family,
+-                  struct nftnl_set *set)
+-{
+-    uint32_t seq = time(NULL);
+-    struct nlmsghdr *nlh;
+-    struct mnl_nlmsg_batch *batch = mnl_nlmsg_batch_start(buf, *len);
+-    nftnl_batch_begin(mnl_nlmsg_batch_current(batch), seq);
+-    mnl_nlmsg_batch_next(batch);
+-    nlh = nftnl_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+-                                NFT_MSG_NEWSETELEM, family,
+-                                NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK,
+-                                ++seq);
+-    nftnl_set_elems_nlmsg_build_payload(nlh, set);
+-    mnl_nlmsg_batch_next(batch);
+-    nftnl_batch_end(mnl_nlmsg_batch_current(batch), seq + 1);
+-    mnl_nlmsg_batch_next(batch);
+-    *len = mnl_nlmsg_batch_size(batch);
+-    mnl_nlmsg_batch_stop(batch);
+-    return seq;
+-}
+-
+-static int
+-nftbl_send_request(void *request, size_t len, uint32_t seq,
+-                   mnl_cb_t cb, void *data)
+-{
+-    struct mnl_socket *nl = mnl_socket_open(NETLINK_NETFILTER);
+-    if (nl == NULL) return -1;
+-
+-    int ret = -1;
+-    uint8_t buf[MNL_SOCKET_BUFFER_SIZE];
+-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) == 0 &&
+-        mnl_socket_sendto(nl, request, len) >= 0) {
+-        uint32_t portid = mnl_socket_get_portid(nl);
+-        while ((ret = mnl_socket_recvfrom(nl, buf, sizeof(buf))) > 0) {
+-            ret = mnl_cb_run(buf, ret, seq, portid, cb, data);
+-            if (ret != MNL_CB_OK)
+-                break;
+-        }
+-        mnl_socket_close(nl);
+-    }
+-    return ret;
+-}
+-
+-static void
+-nftbl_report_addr(const struct sockaddr* addr)
+-{
+-    uint32_t type;
+-    void* data;
+-    size_t size;
+-    if (addr->sa_family == AF_INET) {
+-        type = TYPE_IPADDR;
+-        data = &((struct sockaddr_in*)addr)->sin_addr;
+-        size = sizeof(struct in_addr);
+-    } else if (addr->sa_family == AF_INET6) {
+-        type = TYPE_IP6ADDR;
+-        data = &((struct sockaddr_in6*)addr)->sin6_addr;
+-        size = sizeof(struct in6_addr);
+-    } else {
+-        return;
+-    }
+-
+-    char buf[MNL_SOCKET_BUFFER_SIZE];
+-    for (int i = 0; nftbl_badip_sets[i]; ++i) {
+-        struct nftbl_set_info* si = nftbl_badip_sets[i];
+-        struct nftnl_set *set;
+-        if (si->type == type &&
+-            (set = nftbl_build_set(si->table, si->name, data, size))) {
+-            size_t len = sizeof(buf);
+-            uint32_t seq = nftbl_build_nlmsg(buf, &len, si->family, set);
+-            nftnl_set_free(set);
+-            if (nftbl_send_request(buf, len, seq, NULL, NULL) < 0 &&
+-                errno != EEXIST)
+-                ERROR("nftbl_report_addr");
+-        }
+-    }
+-}
+-
+-static int
+-nftbl_check_cb(const struct nlmsghdr *nlh, void *data)
+-{
+-    struct nftnl_set *set = (struct nftnl_set*)data;
+-    if (nftnl_set_nlmsg_parse(nlh, set) < 0)
+-        return MNL_CB_ERROR;
+-
+-    uint32_t type = nftnl_set_get_u32(set, NFTNL_SET_KEY_TYPE);
+-    if (type != TYPE_IPADDR && type != TYPE_IP6ADDR)
+-        return MNL_CB_OK;
+-
+-    uint32_t len;
+-    const char *name = nftnl_set_get_data(set, NFTNL_SET_NAME, &len);
+-    for (int i = 0; nftbl_badip_sets[i]; ++i) {
+-        struct nftbl_set_info* si = nftbl_badip_sets[i];
+-        if (!memcmp(name, si->name, len)) {
+-            name = nftnl_set_get_data(set, NFTNL_SET_TABLE, &len);
+-            if (!si->table) {
+-                size_t l = strlen(si->name) + 1;
+-                si = realloc(si, sizeof(*si) + l + len);
+-                si->name = (char*)(si + 1);
+-                si->table = memcpy(si->name + l, name, len);
+-                nftbl_badip_sets[i] = si;
+-            } else if (memcmp(name, si->table, len)) {
+-                continue;  /* table name not match */
+-            }
+-            si->family = nftnl_set_get_u32(set, NFTNL_SET_FAMILY);
+-            si->type = type;
+-        }
+-    }
+-    return MNL_CB_OK;
+-}
+-
+-static int
+-nftbl_check(void)
+-{
+-    struct nftnl_set *set = nftnl_set_alloc();
+-    if (!set) return -1;
+-
+-    int ret;
+-    char buf[MNL_SOCKET_BUFFER_SIZE];
+-    uint32_t seq = time(NULL);
+-    struct nlmsghdr *nlh;
+-    nlh = nftnl_set_nlmsg_build_hdr(buf, NFT_MSG_GETSET, NFPROTO_UNSPEC,
+-                                    NLM_F_DUMP|NLM_F_ACK, seq);
+-    nftnl_set_nlmsg_build_payload(nlh, set);
+-    ret = nftbl_send_request(nlh, nlh->nlmsg_len, seq, nftbl_check_cb, set);
+-    nftnl_set_free(set);
+-    if (ret < 0) return ret;
+-
+-    for (int i = 0; nftbl_badip_sets[i]; ++i) {
+-        struct nftbl_set_info* si = nftbl_badip_sets[i];
+-        if (si->family == NFPROTO_UNSPEC) {
+-            if (si->table)
+-                LOGE("set '%s' not found in table '%s'", si->name, si->table);
+-            else
+-                LOGE("set '%s' not found", si->name);
+-            ret = -1;
+-        }
+-    }
+-    if (ret < 0)
+-        FATAL("Check nftables configuration.");
+-    return ret;
+-}
+-
+-static int
+-nftbl_init(const char* set_str)
+-{
+-    struct nftbl_set_info* si;
+-    const char *p0 = set_str, *p = p0, *d = NULL;
+-    int i = 0;
+-    do {
+-        if (*p == ':') {
+-            d = p;
+-        } else if (*p == ',' || *p == '\0') {
+-            size_t l = p - p0 + 1;
+-            si = malloc(sizeof(*si) + l);
+-            memset(si, 0, sizeof(*si));
+-            si->name = memcpy(si + 1, p0, l);
+-            si->name[l - 1] = '\0';
+-            if (d) {
+-                si->table = si->name;
+-                si->name = si->table + (d - p0);
+-                *(si->name++) = '\0';
+-                d = NULL;
+-            }
+-            nftbl_badip_sets[i++] = si;
+-            if (i == sizeof(nftbl_badip_sets) / sizeof(*si) - 1)
+-                break;
+-            while (*p && isspace(*(++p)));
+-            p0 = p;
+-        }
+-    } while (*(p++));
+-    return nftbl_check();
+-}
+-#endif
+-
 -static void
 -report_addr(int fd, const char *info)
 -{
@@ -5943,6 +6304,13 @@ index c52dfa1..0000000
 -    if (peer_name != NULL) {
 -        LOGE("failed to handshake with %s: %s", peer_name, info);
 -    }
+-
+-#ifdef USE_NFTABLES
+-    struct sockaddr_in6 addr;
+-    socklen_t len = sizeof(struct sockaddr_in6);
+-    if (!getpeername(fd, (struct sockaddr *)&addr, &len))
+-        nftbl_report_addr((struct sockaddr *)&addr);
+-#endif
 -}
 -
 -int
@@ -5989,7 +6357,7 @@ index c52dfa1..0000000
 -{
 -    struct addrinfo hints;
 -    struct addrinfo *result, *rp, *ipv4v6bindall;
--    int s, listen_sock;
+-    int s, listen_sock = -1;
 -
 -    memset(&hints, 0, sizeof(struct addrinfo));
 -    hints.ai_family   = AF_UNSPEC;               /* Return IPv4 and IPv6 choices */
@@ -6033,7 +6401,11 @@ index c52dfa1..0000000
 -    }
 -
 -    for (/*rp = result*/; rp != NULL; rp = rp->ai_next) {
--        listen_sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+-        int protocol = rp->ai_protocol;
+-        if (mptcp < 0) {
+-            protocol = IPPROTO_MPTCP; // Enable upstream MPTCP
+-        }
+-        listen_sock = socket(rp->ai_family, rp->ai_socktype, protocol);
 -        if (listen_sock == -1) {
 -            continue;
 -        }
@@ -6055,6 +6427,7 @@ index c52dfa1..0000000
 -            }
 -        }
 -
+-        // Enable out-of-tree mptcp
 -        if (mptcp == 1) {
 -            int i = 0;
 -            while ((mptcp = mptcp_enabled_values[i]) > 0) {
@@ -6065,7 +6438,7 @@ index c52dfa1..0000000
 -                i++;
 -            }
 -            if (mptcp == 0) {
--                ERROR("failed to enable multipath TCP");
+-                ERROR("failed to enable out-of-tree multipath TCP");
 -            }
 -        }
 -
@@ -6131,6 +6504,14 @@ index c52dfa1..0000000
 -    setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
 -    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+-
+-    if (tcp_outgoing_sndbuf > 0) {
+-        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_outgoing_rcvbuf > 0) {
+-        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
+-    }
 -
 -    // setup remote socks
 -
@@ -6409,11 +6790,6 @@ index c52dfa1..0000000
 -        return;
 -    } else if (err == CRYPTO_NEED_MORE) {
 -        if (server->stage != STAGE_STREAM) {
--            if (server->frag > MAX_FRAG) {
--                report_addr(server->fd, "malicious fragmentation");
--                stop_server(EV_A_ server);
--                return;
--            }
 -            server->frag++;
 -        }
 -        return;
@@ -7199,6 +7575,15 @@ index c52dfa1..0000000
 -#ifdef SO_NOSIGPIPE
 -    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
+-
+-    if (tcp_incoming_sndbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_incoming_rcvbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+-    }
+-
 -    setnonblocking(serverfd);
 -
 -    server_t *server = new_server(serverfd, listener);
@@ -7238,6 +7623,10 @@ index c52dfa1..0000000
 -    static struct option long_options[] = {
 -        { "fast-open",       no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
 -        { "reuse-port",      no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+-        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+-        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+-        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+-        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
 -        { "no-delay",        no_argument,       NULL, GETOPT_VAL_NODELAY     },
 -        { "acl",             required_argument, NULL, GETOPT_VAL_ACL         },
 -        { "manager-address", required_argument, NULL,
@@ -7250,6 +7639,9 @@ index c52dfa1..0000000
 -        { "key",             required_argument, NULL, GETOPT_VAL_KEY         },
 -#ifdef __linux__
 -        { "mptcp",           no_argument,       NULL, GETOPT_VAL_MPTCP       },
+-#ifdef USE_NFTABLES
+-        { "nftables-sets",   required_argument, NULL, GETOPT_VAL_NFTABLES_SETS },
+-#endif
 -#endif
 -        { NULL,              0,                 NULL, 0                      }
 -    };
@@ -7286,8 +7678,9 @@ index c52dfa1..0000000
 -            plugin_opts = optarg;
 -            break;
 -        case GETOPT_VAL_MPTCP:
--            mptcp = 1;
--            LOGI("enable multipath TCP");
+-            mptcp = get_mptcp(1);
+-            if (mptcp)
+-                LOGI("enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
 -            break;
 -        case GETOPT_VAL_KEY:
 -            key = optarg;
@@ -7295,6 +7688,23 @@ index c52dfa1..0000000
 -        case GETOPT_VAL_REUSE_PORT:
 -            reuse_port = 1;
 -            break;
+-        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+-            tcp_incoming_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+-            tcp_incoming_rcvbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+-            tcp_outgoing_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+-            tcp_outgoing_rcvbuf = atoi(optarg);
+-            break;
+-#ifdef USE_NFTABLES
+-        case GETOPT_VAL_NFTABLES_SETS:
+-            nftbl_init(optarg);
+-            break;
+-#endif
 -        case 's':
 -            if (server_num < MAX_REMOTE_NUM) {
 -                parse_addr(optarg, &server_addr[server_num++]);
@@ -7421,6 +7831,18 @@ index c52dfa1..0000000
 -        if (reuse_port == 0) {
 -            reuse_port = conf->reuse_port;
 -        }
+-        if (tcp_incoming_sndbuf == 0) {
+-            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+-        }
+-        if (tcp_incoming_rcvbuf == 0) {
+-            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+-        }
+-        if (tcp_outgoing_sndbuf == 0) {
+-            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+-        }
+-        if (tcp_outgoing_rcvbuf == 0) {
+-            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
+-        }
 -        if (fast_open == 0) {
 -            fast_open = conf->fast_open;
 -        }
@@ -7446,6 +7868,38 @@ index c52dfa1..0000000
 -            LOGI("initializing acl...");
 -            acl = !init_acl(conf->acl);
 -        }
+-    }
+-
+-    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_sndbuf = 0;
+-    }
+-
+-    if (tcp_incoming_sndbuf != 0) {
+-        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_rcvbuf = 0;
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0) {
+-        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_sndbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0) {
+-        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_rcvbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0) {
+-        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
 -    }
 -
 -    if (server_num == 0) {
@@ -7987,12 +8441,37 @@ index 42dbcfe..0000000
 -} __attribute__((packed, aligned(1)));
 -
 -#endif // _SOCKS5_H
+diff --git a/src/stream.c b/src/stream.c
+index b2e2cea..4a09933 100644
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -318,9 +318,6 @@ stream_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
+     cipher_ctx_set_nonce(&cipher_ctx, nonce, nonce_len, 1);
+     memcpy(ciphertext->data, nonce, nonce_len);
+ 
+-#ifdef MODULE_REMOTE
+-    ppbloom_add((void *)nonce, nonce_len);
+-#endif
+ 
+     if (cipher->method >= SALSA20) {
+         crypto_stream_xor_ic((uint8_t *)(ciphertext->data + nonce_len),
+@@ -376,10 +373,6 @@ stream_encrypt(buffer_t *plaintext, cipher_ctx_t *cipher_ctx, size_t capacity)
+         memcpy(ciphertext->data, cipher_ctx->nonce, nonce_len);
+         cipher_ctx->counter = 0;
+         cipher_ctx->init    = 1;
+-
+-#ifdef MODULE_REMOTE
+-        ppbloom_add((void *)cipher_ctx->nonce, nonce_len);
+-#endif
+     }
+ 
+     if (cipher->method >= SALSA20) {
 diff --git a/src/tunnel.c b/src/tunnel.c
 deleted file mode 100644
-index a928e61..0000000
+index 99ed412..0000000
 --- a/src/tunnel.c
 +++ /dev/null
-@@ -1,1359 +0,0 @@
+@@ -1,1449 +0,0 @@
 -/*
 - * tunnel.c - Setup a local port forwarding through remote shadowsocks server
 - *
@@ -8077,6 +8556,10 @@ index a928e61..0000000
 -
 -int verbose    = 0;
 -int reuse_port = 0;
+-int tcp_incoming_sndbuf = 0;
+-int tcp_incoming_rcvbuf = 0;
+-int tcp_outgoing_sndbuf = 0;
+-int tcp_outgoing_rcvbuf = 0;
 -
 -static crypto_t *crypto;
 -
@@ -8120,7 +8603,7 @@ index a928e61..0000000
 -{
 -    struct addrinfo hints;
 -    struct addrinfo *result, *rp;
--    int s, listen_sock;
+-    int s, listen_sock = -1;
 -
 -    memset(&hints, 0, sizeof(struct addrinfo));
 -    hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
@@ -8716,10 +9199,22 @@ index a928e61..0000000
 -    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
 -
+-    if (tcp_incoming_sndbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_incoming_rcvbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+-    }
+-
 -    int index                    = rand() % listener->remote_num;
 -    struct sockaddr *remote_addr = listener->remote_addr[index];
 -
--    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
+-    int protocol = IPPROTO_TCP;
+-    if (listener->mptcp < 0) {
+-        protocol = IPPROTO_MPTCP; // Enable upstream MPTCP
+-    }
+-    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
 -    if (remotefd == -1) {
 -        ERROR("socket");
 -        return;
@@ -8750,10 +9245,11 @@ index a928e61..0000000
 -    setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 -#endif
 -
+-    // Enable out-of-tree MPTCP
 -    if (listener->mptcp > 1) {
 -        int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
 -        if (err == -1) {
--            ERROR("failed to enable multipath TCP");
+-            ERROR("failed to enable out-of-tree multipath TCP");
 -        }
 -    } else if (listener->mptcp == 1) {
 -        int i = 0;
@@ -8765,8 +9261,16 @@ index a928e61..0000000
 -            i++;
 -        }
 -        if (listener->mptcp == 0) {
--            ERROR("failed to enable multipath TCP");
+-            ERROR("failed to enable out-of-tree multipath TCP");
 -        }
+-    }
+-
+-    if (tcp_outgoing_sndbuf > 0) {
+-        setsockopt(remotefd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+-    }
+-
+-    if (tcp_outgoing_rcvbuf > 0) {
+-        setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
 -    }
 -
 -    // Setup
@@ -8893,6 +9397,10 @@ index a928e61..0000000
 -        { "plugin",      required_argument, NULL, GETOPT_VAL_PLUGIN      },
 -        { "plugin-opts", required_argument, NULL, GETOPT_VAL_PLUGIN_OPTS },
 -        { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+-        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+-        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+-        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+-        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
 -        { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
 -        { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
 -        { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
@@ -8919,8 +9427,9 @@ index a928e61..0000000
 -            LOGI("set MTU to %d", mtu);
 -            break;
 -        case GETOPT_VAL_MPTCP:
--            mptcp = 1;
--            LOGI("enable multipath TCP");
+-            mptcp = get_mptcp(1);
+-            if (mptcp)
+-                LOGI("enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
 -            break;
 -        case GETOPT_VAL_NODELAY:
 -            no_delay = 1;
@@ -8937,6 +9446,18 @@ index a928e61..0000000
 -            break;
 -        case GETOPT_VAL_REUSE_PORT:
 -            reuse_port = 1;
+-            break;
+-        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+-            tcp_incoming_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+-            tcp_incoming_rcvbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+-            tcp_outgoing_sndbuf = atoi(optarg);
+-            break;
+-        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+-            tcp_outgoing_rcvbuf = atoi(optarg);
 -            break;
 -        case 's':
 -            if (remote_num < MAX_REMOTE_NUM) {
@@ -9081,6 +9602,18 @@ index a928e61..0000000
 -        if (reuse_port == 0) {
 -            reuse_port = conf->reuse_port;
 -        }
+-        if (tcp_incoming_sndbuf == 0) {
+-            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+-        }
+-        if (tcp_incoming_rcvbuf == 0) {
+-            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+-        }
+-        if (tcp_outgoing_sndbuf == 0) {
+-            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+-        }
+-        if (tcp_outgoing_rcvbuf == 0) {
+-            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
+-        }
 -        if (fast_open == 0) {
 -            fast_open = conf->fast_open;
 -        }
@@ -9100,6 +9633,38 @@ index a928e61..0000000
 -#ifdef __MINGW32__
 -    winsock_init();
 -#endif
+-
+-    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_sndbuf = 0;
+-    }
+-
+-    if (tcp_incoming_sndbuf != 0) {
+-        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_incoming_rcvbuf = 0;
+-    }
+-
+-    if (tcp_incoming_rcvbuf != 0) {
+-        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_sndbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_sndbuf != 0) {
+-        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+-        tcp_outgoing_rcvbuf = 0;
+-    }
+-
+-    if (tcp_outgoing_rcvbuf != 0) {
+-        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
+-    }
 -
 -    if (plugin != NULL) {
 -        uint16_t port = get_local_port();
@@ -9342,6 +9907,10 @@ index a928e61..0000000
 -        stop_plugin();
 -    }
 -
+-    for (i = 0; i < remote_num; i++)
+-        ss_free(listen_ctx.remote_addr[i]);
+-    ss_free(listen_ctx.remote_addr);
+-
 -#ifdef __MINGW32__
 -    if (plugin_watcher.valid) {
 -        closesocket(plugin_watcher.fd);
@@ -9450,10 +10019,19 @@ index 4e9fbf8..0000000
 -
 -#endif // _TUNNEL_H
 diff --git a/src/udprelay.c b/src/udprelay.c
-index 0ebef4f..b91dbed 100644
+index 49ce98a..578e024 100644
 --- a/src/udprelay.c
 +++ b/src/udprelay.c
-@@ -53,56 +53,22 @@
+@@ -40,7 +40,7 @@
+ #include "config.h"
+ #endif
+ 
+-#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
++#if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H)
+ #include <net/if.h>
+ #include <sys/ioctl.h>
+ #define SET_INTERFACE
+@@ -53,18 +53,7 @@
  #include "cache.h"
  #include "udprelay.h"
  #include "winsock.h"
@@ -9472,14 +10050,7 @@ index 0ebef4f..b91dbed 100644
  
  #ifndef EAGAIN
  #define EAGAIN EWOULDBLOCK
- #endif
- 
--#ifndef EWOULDBLOCK
--#define EWOULDBLOCK EAGAIN
--#endif
--
- static void server_recv_cb(EV_P_ ev_io *w, int revents);
- static void remote_recv_cb(EV_P_ ev_io *w, int revents);
+@@ -79,30 +68,11 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents);
  static void remote_timeout_cb(EV_P_ ev_timer *watcher, int revents);
  
  static char *hash_key(const int af, const struct sockaddr_storage *addr);
@@ -9510,7 +10081,7 @@ index 0ebef4f..b91dbed 100644
  
  static int packet_size                               = DEFAULT_PACKET_SIZE;
  static int buf_size                                  = DEFAULT_PACKET_SIZE * 2;
-@@ -111,7 +77,6 @@ static server_ctx_t *server_ctx_list[MAX_REMOTE_NUM] = { NULL };
+@@ -111,7 +81,6 @@ static server_ctx_t *server_ctx_list[MAX_REMOTE_NUM] = { NULL };
  
  const char *s_port = NULL;
  
@@ -9518,7 +10089,7 @@ index 0ebef4f..b91dbed 100644
  static int
  setnonblocking(int fd)
  {
-@@ -122,18 +87,6 @@ setnonblocking(int fd)
+@@ -122,18 +91,6 @@ setnonblocking(int fd)
      return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
  }
  
@@ -9537,16 +10108,43 @@ index 0ebef4f..b91dbed 100644
  #ifdef SO_NOSIGPIPE
  static int
  set_nosigpipe(int socket_fd)
-@@ -206,7 +159,7 @@ hash_key(const int af, const struct sockaddr_storage *addr)
+@@ -144,8 +101,6 @@ set_nosigpipe(int socket_fd)
+ 
+ #endif
+ 
+-#ifdef MODULE_REDIR
+-
+ #ifndef IP_TRANSPARENT
+ #define IP_TRANSPARENT       19
+ #endif
+@@ -190,8 +145,6 @@ get_dstaddr(struct msghdr *msg, struct sockaddr_storage *dstaddr)
+     return 1;
+ }
+ 
+-#endif
+-
+ #define HASH_KEY_LEN sizeof(struct sockaddr_storage) + sizeof(int)
+ static char *
+ hash_key(const int af, const struct sockaddr_storage *addr)
+@@ -206,8 +159,6 @@ hash_key(const int af, const struct sockaddr_storage *addr)
      return key;
  }
  
 -#if defined(MODULE_REDIR) || defined(MODULE_REMOTE)
-+#if defined(MODULE_REDIR)
- 
+-
  static int
  construct_udprelay_header(const struct sockaddr_storage *in_addr,
-@@ -382,24 +335,10 @@ create_remote_socket(int ipv6)
+                           char *addr_header)
+@@ -239,8 +190,6 @@ construct_udprelay_header(const struct sockaddr_storage *in_addr,
+     return addr_header_len;
+ }
+ 
+-#endif
+-
+ static int
+ parse_udprelay_header(const char *buf, const size_t buf_len,
+                       char *host, char *port, struct sockaddr_storage *storage)
+@@ -382,24 +331,10 @@ create_remote_socket(int ipv6)
              ERROR("[udp] cannot create socket");
              return -1;
          }
@@ -9571,7 +10169,7 @@ index 0ebef4f..b91dbed 100644
      } else {
          // Or else bind to IPv4
          struct sockaddr_in addr;
-@@ -412,24 +351,10 @@ create_remote_socket(int ipv6)
+@@ -412,31 +347,15 @@ create_remote_socket(int ipv6)
              ERROR("[udp] cannot create socket");
              return -1;
          }
@@ -9594,9 +10192,44 @@ index 0ebef4f..b91dbed 100644
 -    }
 -#endif
      }
+ 
+-#if defined(__linux__)
+     // Disable fragmentation
+     int val = IP_PMTUDISC_DO;
+     setsockopt(remote_sock, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val));
+-#endif
+ 
      return remote_sock;
  }
-@@ -576,33 +501,6 @@ new_server_ctx(int fd)
+@@ -523,7 +442,6 @@ create_server_socket(const char *host, const char *port)
+ #endif
+ #endif
+ 
+-#ifdef MODULE_REDIR
+         int sol    = rp->ai_family == AF_INET ? SOL_IP : SOL_IPV6;
+         int flag_t = rp->ai_family == AF_INET ? IP_TRANSPARENT : IPV6_TRANSPARENT;
+         int flag_r = rp->ai_family == AF_INET ? IP_RECVORIGDSTADDR : IPV6_RECVORIGDSTADDR;
+@@ -536,7 +454,6 @@ create_server_socket(const char *host, const char *port)
+         if (setsockopt(server_sock, sol, flag_r, &opt, sizeof(opt))) {
+             FATAL("[udp] setsockopt IP_RECVORIGDSTADDR");
+         }
+-#endif
+ 
+         s = bind(server_sock, rp->ai_addr, rp->ai_addrlen);
+         if (s == 0) {
+@@ -552,11 +469,9 @@ create_server_socket(const char *host, const char *port)
+ 
+     freeaddrinfo(result);
+ 
+-#if defined(__linux__)
+     // Disable fragmentation
+     int val = IP_PMTUDISC_DO;
+     setsockopt(server_sock, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val));
+-#endif
+ 
+     return server_sock;
+ }
+@@ -591,33 +506,6 @@ new_server_ctx(int fd)
      return ctx;
  }
  
@@ -9630,7 +10263,7 @@ index 0ebef4f..b91dbed 100644
  void
  close_and_free_remote(EV_P_ remote_ctx_t *ctx)
  {
-@@ -628,104 +526,6 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+@@ -643,106 +531,6 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
      cache_remove(remote_ctx->server_ctx->conn_cache, key, HASH_KEY_LEN);
  }
  
@@ -9681,10 +10314,12 @@ index 0ebef4f..b91dbed 100644
 -                if (rc < 0 && errno != ENOPROTOOPT) {
 -                    LOGE("setting ipv4 dscp failed: %d", errno);
 -                }
+-#ifdef IPV6_TCLASS
 -                rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
 -                if (rc < 0 && errno != ENOPROTOOPT) {
 -                    LOGE("setting ipv6 dscp failed: %d", errno);
 -                }
+-#endif
 -#endif
 -#ifdef SET_INTERFACE
 -                if (query_ctx->server_ctx->iface) {
@@ -9732,10 +10367,10 @@ index 0ebef4f..b91dbed 100644
 -
 -#endif
 -
- static void
- remote_recv_cb(EV_P_ ev_io *w, int revents)
- {
-@@ -767,7 +567,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ void convert_ipv4_mapped_ipv6(struct sockaddr_storage* addr) {
+     if (addr->ss_family == AF_INET) {
+         struct sockaddr_in* ipv4_addr = (struct sockaddr_in*)addr;
+@@ -807,7 +595,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
  
      buf->len = r;
  
@@ -9743,10 +10378,43 @@ index 0ebef4f..b91dbed 100644
      int err = server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
      if (err) {
          LOGE("failed to handshake with %s: %s",
-@@ -810,30 +609,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
-     memset(buf->data, 0, 3);
-     buf->len += 3;
- #endif
+@@ -816,7 +603,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+         goto CLEAN_UP;
+     }
+ 
+-#ifdef MODULE_REDIR
+     struct sockaddr_storage dst_addr;
+     memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
+     int len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, &dst_addr);
+@@ -825,9 +611,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+         LOGI("[udp] ss-redir does not support domain name");
+         goto CLEAN_UP;
+     }
+-#else
+-    int len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, NULL);
+-#endif
+ 
+     if (len == 0) {
+         // error when parsing header
+@@ -835,45 +618,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+         goto CLEAN_UP;
+     }
+ 
+-#if defined(MODULE_TUNNEL) || defined(MODULE_REDIR)
+     // Construct packet
+     buf->len -= len;
+     memmove(buf->data, buf->data + len, buf->len);
+-#else
+-#ifdef __ANDROID__
+-    rx += buf->len;
+-    stat_update_cb();
+-#endif
+-    // Construct packet
+-    brealloc(buf, buf->len + 3, buf_size);
+-    memmove(buf->data + 3, buf->data, buf->len);
+-    memset(buf->data, 0, 3);
+-    buf->len += 3;
+-#endif
 -
 -#endif
 -
@@ -9771,20 +10439,77 @@ index 0ebef4f..b91dbed 100644
 -    }
 -
 -#endif
-+    
  
      if (buf->len > packet_size) {
          if (verbose) {
-@@ -896,7 +672,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
- 
-     int s = sendto(server_ctx->fd, buf->data, buf->len, 0,
-                    (struct sockaddr *)&remote_ctx->src_addr, remote_src_addr_len);
--    if (s == -1 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
-+    if (s == -1 && !(errno == EAGAIN)) {
-         ERROR("[udp] remote_recv_sendto");
-         goto CLEAN_UP;
+@@ -881,8 +628,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+         }
      }
-@@ -984,26 +760,12 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+-
+-#ifdef MODULE_REDIR
+     convert_ipv4_mapped_ipv6(&dst_addr);
+ 
+     size_t remote_dst_addr_len = get_sockaddr_len((struct sockaddr *)&dst_addr);
+@@ -943,18 +688,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+     }
+     close(src_fd);
+ 
+-#else
+-    size_t remote_src_addr_len = get_sockaddr_len((struct sockaddr *)&remote_ctx->src_addr);
+-
+-    int s = sendto(server_ctx->fd, buf->data, buf->len, 0,
+-                   (struct sockaddr *)&remote_ctx->src_addr, remote_src_addr_len);
+-    if (s == -1 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
+-        ERROR("[udp] remote_recv_sendto");
+-        goto CLEAN_UP;
+-    }
+-
+-#endif
+-
+     // handle the UDP packet successfully,
+     // triger the timer
+     ev_timer_again(EV_A_ & remote_ctx->watcher);
+@@ -965,6 +698,7 @@ CLEAN_UP:
+     ss_free(buf);
+ }
+ 
++
+ static void
+ server_recv_cb(EV_P_ ev_io *w, int revents)
+ {
+@@ -978,7 +712,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     socklen_t src_addr_len = sizeof(struct sockaddr_storage);
+     unsigned int offset    = 0;
+ 
+-#ifdef MODULE_REDIR
+     char control_buffer[64] = { 0 };
+     struct msghdr msg;
+     memset(&msg, 0, sizeof(struct msghdr));
+@@ -1013,51 +746,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     }
+ 
+     src_addr_len = msg.msg_namelen;
+-#else
+-    ssize_t r;
+-    r = recvfrom(server_ctx->fd, buf->data, buf_size,
+-                 0, (struct sockaddr *)&src_addr, &src_addr_len);
+-
+-    if (r == -1) {
+-        // error on recv
+-        // simply drop that packet
+-        ERROR("[udp] server_recv_recvfrom");
+-        goto CLEAN_UP;
+-    } else if (r > packet_size) {
+-        if (verbose) {
+-            LOGI("[udp] server_recv_recvfrom fragmentation, MTU at least be: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
+-        }
+-    }
+-
+-    buf->len = r;
+-#endif
+ 
+     if (verbose) {
          LOGI("[udp] server receive a packet");
      }
  
@@ -9801,26 +10526,153 @@ index 0ebef4f..b91dbed 100644
 -#endif
 -
 -#ifdef MODULE_LOCAL
- #if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
- #ifdef __ANDROID__
-     tx += buf->len;
- #endif
-     uint8_t frag = *(uint8_t *)(buf->data + 2);
-     offset += 3;
+-#if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
+-#ifdef __ANDROID__
+-    tx += buf->len;
 -#endif
- #endif
- 
+-    uint8_t frag = *(uint8_t *)(buf->data + 2);
+-    offset += 3;
+-#endif
+-#endif
+-
      /*
-@@ -1182,8 +944,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+      *
+      * SOCKS5 UDP Request
+@@ -1097,7 +790,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+      *
+      */
+ 
+-#ifdef MODULE_REDIR
+     char addr_header[MAX_ADDR_HEADER_SIZE] = { 0 };
+     int addr_header_len                    = construct_udprelay_header(&dst_addr, addr_header);
+ 
+@@ -1112,83 +804,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     memcpy(buf->data, addr_header, addr_header_len);
+     buf->len += addr_header_len;
+ 
+-#elif MODULE_TUNNEL
+-
+-    char addr_header[MAX_ADDR_HEADER_SIZE] = { 0 };
+-    char *host                             = server_ctx->tunnel_addr.host;
+-    char *port                             = server_ctx->tunnel_addr.port;
+-    uint16_t port_num                      = (uint16_t)atoi(port);
+-    uint16_t port_net_num                  = htons(port_num);
+-    int addr_header_len                    = 0;
+-
+-    struct cork_ip ip;
+-    if (cork_ip_init(&ip, host) != -1) {
+-        if (ip.version == 4) {
+-            // send as IPv4
+-            struct in_addr host_addr;
+-            memset(&host_addr, 0, sizeof(struct in_addr));
+-            int host_len = sizeof(struct in_addr);
+-
+-            if (inet_pton(AF_INET, host, &host_addr) == -1) {
+-                FATAL("IP parser error");
+-            }
+-            addr_header[addr_header_len++] = 1;
+-            memcpy(addr_header + addr_header_len, &host_addr, host_len);
+-            addr_header_len += host_len;
+-        } else if (ip.version == 6) {
+-            // send as IPv6
+-            struct in6_addr host_addr;
+-            memset(&host_addr, 0, sizeof(struct in6_addr));
+-            int host_len = sizeof(struct in6_addr);
+-
+-            if (inet_pton(AF_INET6, host, &host_addr) == -1) {
+-                FATAL("IP parser error");
+-            }
+-            addr_header[addr_header_len++] = 4;
+-            memcpy(addr_header + addr_header_len, &host_addr, host_len);
+-            addr_header_len += host_len;
+-        } else {
+-            FATAL("IP parser error");
+-        }
+-    } else {
+-        // send as domain
+-        int host_len = strlen(host);
+-
+-        addr_header[addr_header_len++] = 3;
+-        addr_header[addr_header_len++] = host_len;
+-        memcpy(addr_header + addr_header_len, host, host_len);
+-        addr_header_len += host_len;
+-    }
+-    memcpy(addr_header + addr_header_len, &port_net_num, 2);
+-    addr_header_len += 2;
+-
+-    // reconstruct the buffer
+-    brealloc(buf, buf->len + addr_header_len, buf_size);
+-    memmove(buf->data + addr_header_len, buf->data, buf->len);
+-    memcpy(buf->data, addr_header, addr_header_len);
+-    buf->len += addr_header_len;
+-
+-#else
+-
+-    char host[MAX_HOSTNAME_LEN] = { 0 };
+-    char port[MAX_PORT_STR_LEN] = { 0 };
+-    struct sockaddr_storage dst_addr;
+-    memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
+-
+-    int addr_header_len = parse_udprelay_header(buf->data + offset, buf->len - offset,
+-                                                host, port, &dst_addr);
+-    if (addr_header_len == 0) {
+-        // error in parse header
+-        goto CLEAN_UP;
+-    }
+-
+-#endif
+-
+-#ifdef MODULE_LOCAL
+     char *key = hash_key(server_ctx->remote_addr->sa_family, &src_addr);
+-#else
+-    char *key = hash_key(dst_addr.ss_family, &src_addr);
+-#endif
+ 
+     struct cache *conn_cache = server_ctx->conn_cache;
+ 
+@@ -1208,41 +824,22 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+     if (remote_ctx == NULL) {
+         if (verbose) {
+-#ifdef MODULE_REDIR
+             char src[SS_ADDRSTRLEN];
+             char dst[SS_ADDRSTRLEN];
+             strcpy(src, get_addr_str((struct sockaddr *)&src_addr, true));
+             strcpy(dst, get_addr_str((struct sockaddr *)&dst_addr, true));
+             LOGI("[%s] [udp] cache miss: %s <-> %s", s_port, dst, src);
+-#else
+-            LOGI("[%s] [udp] cache miss: %s:%s <-> %s", s_port, host, port,
+-                 get_addr_str((struct sockaddr *)&src_addr, true));
+-#endif
+         }
+     } else {
+         if (verbose) {
+-#ifdef MODULE_REDIR
+             char src[SS_ADDRSTRLEN];
+             char dst[SS_ADDRSTRLEN];
+             strcpy(src, get_addr_str((struct sockaddr *)&src_addr, true));
+             strcpy(dst, get_addr_str((struct sockaddr *)&dst_addr, true));
+             LOGI("[%s] [udp] cache hit: %s <-> %s", s_port, dst, src);
+-#else
+-            LOGI("[%s] [udp] cache hit: %s:%s <-> %s", s_port, host, port,
+-                 get_addr_str((struct sockaddr *)&src_addr, true));
+-#endif
          }
      }
  
 -#ifdef MODULE_LOCAL
 -
- #if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
-     if (frag) {
-         LOGE("[udp] drop a message since frag is not 0, but %d", frag);
-@@ -1225,16 +985,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+-#if !defined(MODULE_TUNNEL) && !defined(MODULE_REDIR)
+-    if (frag) {
+-        LOGE("[udp] drop a message since frag is not 0, but %d", frag);
+-        goto CLEAN_UP;
+-    }
+-#endif
+-
+     const struct sockaddr *remote_addr = server_ctx->remote_addr;
+     const int remote_addr_len          = server_ctx->remote_addr_len;
+ 
+@@ -1279,16 +876,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
          }
  #endif
  
@@ -9837,7 +10689,7 @@ index 0ebef4f..b91dbed 100644
          // Init remote_ctx
          remote_ctx           = new_remote(remotefd, server_ctx);
          remote_ctx->src_addr = src_addr;
-@@ -1272,103 +1022,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+@@ -1326,105 +913,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
          ERROR("[udp] server_recv_sendto");
      }
  
@@ -9878,10 +10730,12 @@ index 0ebef4f..b91dbed 100644
 -                if (rc < 0 && errno != ENOPROTOOPT) {
 -                    LOGE("setting ipv4 dscp failed: %d", errno);
 -                }
+-#ifdef IPV6_TCLASS
 -                rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
 -                if (rc < 0 && errno != ENOPROTOOPT) {
 -                    LOGE("setting ipv6 dscp failed: %d", errno);
 -                }
+-#endif
 -#endif
 -#ifdef SET_INTERFACE
 -                if (server_ctx->iface) {
@@ -9941,7 +10795,7 @@ index 0ebef4f..b91dbed 100644
  CLEAN_UP:
      bfree(buf);
      ss_free(buf);
-@@ -1388,12 +1041,7 @@ free_cb(void *key, void *element)
+@@ -1443,12 +931,7 @@ free_cb(void *key, void *element)
  
  int
  init_udprelay(const char *server_host, const char *server_port,
@@ -9954,7 +10808,7 @@ index 0ebef4f..b91dbed 100644
                int mtu, crypto_t *crypto, int timeout, const char *iface)
  {
      s_port = server_port;
-@@ -1421,20 +1069,12 @@ init_udprelay(const char *server_host, const char *server_port,
+@@ -1476,20 +959,12 @@ init_udprelay(const char *server_host, const char *server_port,
      cache_create(&conn_cache, MAX_UDP_CONN_NUM, free_cb);
  
      server_ctx_t *server_ctx = new_server_ctx(serverfd);
@@ -9975,8 +10829,62 @@ index 0ebef4f..b91dbed 100644
  
      ev_io_start(loop, &server_ctx->io);
  
+diff --git a/src/udprelay.h b/src/udprelay.h
+index 7242491..132c9cc 100644
+--- a/src/udprelay.h
++++ b/src/udprelay.h
+@@ -34,10 +34,6 @@
+ #include "crypto.h"
+ #include "jconf.h"
+ 
+-#ifdef MODULE_REMOTE
+-#include "resolv.h"
+-#endif
+-
+ #include "cache.h"
+ 
+ #include "common.h"
+@@ -55,38 +51,16 @@ typedef struct server_ctx {
+     int timeout;
+     const char *iface;
+     struct cache *conn_cache;
+-#ifdef MODULE_LOCAL
+     const struct sockaddr *remote_addr;
+     int remote_addr_len;
+-#ifdef MODULE_TUNNEL
+-    ss_addr_t tunnel_addr;
+-#endif
+-#endif
+-#ifdef MODULE_REMOTE
+-    struct ev_loop *loop;
+-#endif
+ } server_ctx_t;
+ 
+-#ifdef MODULE_REMOTE
+-typedef struct query_ctx {
+-    struct sockaddr_storage src_addr;
+-    buffer_t *buf;
+-    int addr_header_len;
+-    char addr_header[MAX_ADDR_HEADER_SIZE];
+-    struct server_ctx *server_ctx;
+-    struct remote_ctx *remote_ctx;
+-} query_ctx_t;
+-#endif
+-
+ typedef struct remote_ctx {
+     ev_io io;
+     ev_timer watcher;
+     int af;
+     int fd;
+     struct sockaddr_storage src_addr;
+-#ifdef MODULE_REMOTE
+-    struct sockaddr_storage dst_addr;
+-#endif
+     struct server_ctx *server_ctx;
+ } remote_ctx_t;
+ 
 diff --git a/src/utils.c b/src/utils.c
-index 0e94e5d..4eb601b 100644
+index d3ff2ab..553e1ac 100644
 --- a/src/utils.c
 +++ b/src/utils.c
 @@ -27,14 +27,10 @@
@@ -10029,10 +10937,11 @@ index 0e94e5d..4eb601b 100644
  
      return 1;
  }
-@@ -291,15 +280,7 @@ usage()
+@@ -290,17 +279,7 @@ usage()
+     printf(
          "  maintained by Max Lv <max.c.lv@gmail.com> and Linus Yang <laokongzi@gmail.com>\n\n");
      printf("  usage:\n\n");
- #ifdef MODULE_LOCAL
+-#ifdef MODULE_LOCAL
 -    printf("    ss-local\n");
 -#elif MODULE_REMOTE
 -    printf("    ss-server\n");
@@ -10042,18 +10951,38 @@ index 0e94e5d..4eb601b 100644
      printf("    ss-redir\n");
 -#elif MODULE_MANAGER
 -    printf("    ss-manager\n");
- #endif
+-#endif
      printf("\n");
      printf(
-@@ -363,56 +344,24 @@ usage()
- #ifdef MODULE_REDIR
+         "       -s <server_host>           Host name or IP address of your remote server.\n");
+@@ -344,49 +323,25 @@ usage()
+ #ifdef HAVE_SETRLIMIT
+     printf(
+         "       [-n <number>]              Max number of open files.\n");
+-#endif
+-#ifndef MODULE_REDIR
+-    printf(
+-        "       [-i <interface>]           Network interface to bind.\n");
+ #endif
+     printf(
+         "       [-b <local_address>]       Local address to bind.\n");
+     printf("\n");
+     printf(
+         "       [-u]                       Enable UDP relay.\n");
+-#ifdef MODULE_REDIR
+     printf(
+         "                                  TPROXY is required in redir mode.\n");
+-#endif
+     printf(
+         "       [-U]                       Enable UDP relay and disable TCP relay.\n");
+-#ifdef MODULE_REDIR
      printf(
          "       [-T]                       Use tproxy instead of redirect (for tcp).\n");
 -#endif
 -#ifdef MODULE_REMOTE
 -    printf(
 -        "       [-6]                       Resovle hostname to IPv6 address first.\n");
- #endif
+-#endif
      printf("\n");
 -#ifdef MODULE_TUNNEL
 -    printf(
@@ -10073,6 +11002,13 @@ index 0e94e5d..4eb601b 100644
      printf(
          "                                  with Linux kernel > 3.7.0.\n");
 -#endif
+     printf(
+         "       [--tcp-incoming-sndbuf]    Size of the incoming connection TCP send buffer.\n");
+     printf(
+@@ -395,38 +350,14 @@ usage()
+         "       [--tcp-outgoing-sndbuf]    Size of the outgoing connection TCP send buffer.\n");
+     printf(
+         "       [--tcp-outgoing-rcvbuf]    Size of the outgoing connection TCP receive buffer.\n");
 -#if defined(MODULE_REMOTE) || defined(MODULE_LOCAL)
 -    printf(
 -        "       [--acl <acl_file>]         Path to ACL (Access Control List).\n");
@@ -10089,10 +11025,16 @@ index 0e94e5d..4eb601b 100644
 -#endif
      printf(
          "       [--mtu <MTU>]              MTU of your network interface.\n");
- #ifdef __linux__
+-#ifdef __linux__
      printf(
          "       [--mptcp]                  Enable Multipath TCP on MPTCP Kernel.\n");
- #endif
+-#ifdef USE_NFTABLES
+-    printf(
+-        "       [--nftables-sets <sets>]   Add malicious IP into nftables sets.\n");
+-    printf(
+-        "                                  sets spec: [<table1>:]<set1>[,[<table2>:]<set2>...]\n");
+-#endif
+-#endif
 -#ifndef MODULE_MANAGER
      printf(
          "       [--no-delay]               Enable TCP_NODELAY.\n");
@@ -10102,7 +11044,7 @@ index 0e94e5d..4eb601b 100644
      printf(
          "       [--plugin <name>]          Enable SIP003 plugin. (Experimental)\n");
      printf(
-@@ -428,7 +377,6 @@ usage()
+@@ -442,7 +373,6 @@ usage()
  void
  daemonize(const char *path)
  {
@@ -10110,7 +11052,7 @@ index 0e94e5d..4eb601b 100644
      /* Our process ID and Session ID */
      pid_t pid, sid;
  
-@@ -482,9 +430,6 @@ daemonize(const char *path)
+@@ -496,9 +426,6 @@ daemonize(const char *path)
  
      /* Close the standard file descriptors */
      close(STDIN_FILENO);
@@ -10120,7 +11062,7 @@ index 0e94e5d..4eb601b 100644
  }
  
  #ifdef HAVE_SETRLIMIT
-@@ -519,7 +464,6 @@ set_nofile(int nofile)
+@@ -533,7 +460,6 @@ set_nofile(int nofile)
  char *
  get_default_conf(void)
  {
@@ -10128,7 +11070,7 @@ index 0e94e5d..4eb601b 100644
      static char sysconf[] = "/etc/shadowsocks-libev/config.json";
      static char *userconf = NULL;
      static int buf_size   = 0;
-@@ -552,9 +496,6 @@ get_default_conf(void)
+@@ -566,9 +492,6 @@ get_default_conf(void)
      // If not, fall back to the system-wide config.
      free(userconf);
      return sysconf;

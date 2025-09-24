@@ -1,0 +1,1269 @@
+From 7089c655cd83fee6715289a738777732e6b1f3b4 Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Thu, 25 Sep 2025 15:18:23 +0800
+Subject: [PATCH 7/8] add module prefix in log message
+
+---
+ src/aead.c     |  38 ++++++-------
+ src/crypto.c   |  20 +++----
+ src/jconf.c    |  22 ++++----
+ src/metrics.c  |  10 ++--
+ src/netutils.c |  18 +++---
+ src/plugin.c   |   4 +-
+ src/probe.c    |   8 +--
+ src/redir.c    | 149 ++++++++++++++++++++++++++-----------------------
+ src/stream.c   |  40 ++++++-------
+ src/udprelay.c |   6 +-
+ src/utils.c    |  18 +++---
+ 11 files changed, 169 insertions(+), 164 deletions(-)
+
+diff --git a/src/aead.c b/src/aead.c
+index 73349da..cbca1a9 100644
+--- a/src/aead.c
++++ b/src/aead.c
+@@ -271,7 +271,7 @@ const cipher_kt_t *
+ aead_get_cipher_type(int method)
+ {
+     if (method < AES128GCM || method >= AEAD_CIPHER_NUM) {
+-        LOGE("aead_get_cipher_type(): Illegal method");
++        LOGE("[aead] aead_get_cipher_type(): Illegal method");
+         return NULL;
+     }
+ 
+@@ -283,7 +283,7 @@ aead_get_cipher_type(int method)
+     const char *ciphername  = supported_aead_ciphers[method];
+     const char *mbedtlsname = supported_aead_ciphers_mbedtls[method];
+     if (strcmp(mbedtlsname, CIPHER_UNSUPPORTED) == 0) {
+-        LOGE("Cipher %s currently is not supported by mbed TLS library",
++        LOGE("[aead] cipher %s currently is not supported by mbed TLS library",
+              ciphername);
+         return NULL;
+     }
+@@ -295,7 +295,7 @@ aead_cipher_ctx_set_key(cipher_ctx_t *cipher_ctx, int enc)
+ {
+     const digest_type_t *md = mbedtls_md_info_from_string("SHA1");
+     if (md == NULL) {
+-        FATAL("SHA1 Digest not found in crypto library");
++        FATAL("[aead] SHA1 Digest not found in crypto library");
+     }
+ 
+     int err = crypto_hkdf(md,
+@@ -304,7 +304,7 @@ aead_cipher_ctx_set_key(cipher_ctx_t *cipher_ctx, int enc)
+                           (uint8_t *)SUBKEY_INFO, strlen(SUBKEY_INFO),
+                           cipher_ctx->skey, cipher_ctx->cipher->key_len);
+     if (err) {
+-        FATAL("Unable to generate subkey");
++        FATAL("[aead] unable to generate subkey");
+     }
+ 
+     memset(cipher_ctx->nonce, 0, cipher_ctx->cipher->nonce_len);
+@@ -316,16 +316,16 @@ aead_cipher_ctx_set_key(cipher_ctx_t *cipher_ctx, int enc)
+     if (cipher_ctx->aes256gcm_ctx != NULL) {
+         if (crypto_aead_aes256gcm_beforenm(cipher_ctx->aes256gcm_ctx,
+                                            cipher_ctx->skey) != 0) {
+-            FATAL("Cannot set libsodium cipher key");
++            FATAL("[aead] cannot set libsodium cipher key");
+         }
+         return;
+     }
+     if (mbedtls_cipher_setkey(cipher_ctx->evp, cipher_ctx->skey,
+                               cipher_ctx->cipher->key_len * 8, enc) != 0) {
+-        FATAL("Cannot set mbed TLS cipher key");
++        FATAL("[aead] cannot set mbed TLS cipher key");
+     }
+     if (mbedtls_cipher_reset(cipher_ctx->evp) != 0) {
+-        FATAL("Cannot finish preparation of mbed TLS cipher context");
++        FATAL("[aead] cannot finish preparation of mbed TLS cipher context");
+     }
+ }
+ 
+@@ -333,7 +333,7 @@ static void
+ aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
+ {
+     if (method < AES128GCM || method >= AEAD_CIPHER_NUM) {
+-        LOGE("cipher_context_init(): Illegal method");
++        LOGE("[aead] cipher_context_init(): Illegal method");
+         return;
+     }
+ 
+@@ -355,13 +355,13 @@ aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
+         cipher_evp_t *evp = cipher_ctx->evp;
+         mbedtls_cipher_init(evp);
+         if (mbedtls_cipher_setup(evp, cipher) != 0) {
+-            FATAL("Cannot initialize mbed TLS cipher context");
++            FATAL("[aead] cannot initialize mbed TLS cipher context");
+         }
+     }
+ 
+     if (cipher == NULL) {
+-        LOGE("Cipher %s not found in mbed TLS library", ciphername);
+-        FATAL("Cannot initialize mbed TLS cipher");
++        LOGE("[aead] cipher %s not found in mbed TLS library", ciphername);
++        FATAL("[aead] cannot initialize mbed TLS cipher");
+     }
+ 
+ #ifdef SS_DEBUG
+@@ -470,7 +470,7 @@ aead_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
+     memcpy(salt, ciphertext->data, salt_len);
+ 
+     if (ppbloom_check((void *)salt, salt_len) == 1) {
+-        LOGE("crypto: AEAD: repeat salt detected");
++        LOGE("[aead] crypto: AEAD: repeat salt detected");
+         return CRYPTO_ERROR;
+     }
+ 
+@@ -663,7 +663,7 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
+         memcpy(cipher_ctx->salt, cipher_ctx->chunk->data, salt_len);
+ 
+         if (ppbloom_check((void *)cipher_ctx->salt, salt_len) == 1) {
+-            LOGE("crypto: AEAD: repeat salt detected");
++            LOGE("[aead] crypto: AEAD: repeat salt detected");
+             return CRYPTO_ERROR;
+         }
+ 
+@@ -705,7 +705,7 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
+     // Add the salt to bloom filter
+     if (cipher_ctx->init == 1) {
+         if (ppbloom_check((void *)cipher_ctx->salt, salt_len) == 1) {
+-            LOGE("crypto: AEAD: repeat salt detected");
++            LOGE("[aead] crypto: AEAD: repeat salt detected");
+             return CRYPTO_ERROR;
+         }
+         ppbloom_add((void *)cipher_ctx->salt, salt_len);
+@@ -723,7 +723,7 @@ cipher_t *
+ aead_key_init(int method, const char *pass, const char *key)
+ {
+     if (method < AES128GCM || method >= AEAD_CIPHER_NUM) {
+-        LOGE("aead_key_init(): Illegal method");
++        LOGE("[aead] aead_key_init(): Illegal method");
+         return NULL;
+     }
+ 
+@@ -731,8 +731,8 @@ aead_key_init(int method, const char *pass, const char *key)
+     memset(cipher, 0, sizeof(cipher_t));
+ 
+     if (method < CHACHA20POLY1305IETF && aead_get_cipher_type(method) == NULL) {
+-        LOGE("Cipher %s not found in crypto library", supported_aead_ciphers[method]);
+-        FATAL("Cannot initialize cipher");
++        LOGE("[aead] cipher %s not found in crypto library", supported_aead_ciphers[method]);
++        FATAL("[aead] cannot initialize cipher");
+     }
+ 
+     if (key != NULL)
+@@ -743,7 +743,7 @@ aead_key_init(int method, const char *pass, const char *key)
+                                             supported_aead_ciphers_key_size[method]);
+ 
+     if (cipher->key_len == 0) {
+-        FATAL("Cannot generate key and nonce");
++        FATAL("[aead] cannot generate key and nonce");
+     }
+ 
+     cipher->nonce_len = supported_aead_ciphers_nonce_size[method];
+@@ -764,7 +764,7 @@ aead_init(const char *pass, const char *key, const char *method)
+                 break;
+             }
+         if (m >= AEAD_CIPHER_NUM) {
+-            LOGE("Invalid cipher name: %s, use chacha20-ietf-poly1305 instead", method);
++            LOGE("[aead] invalid cipher name: %s, use chacha20-ietf-poly1305 instead", method);
+             m = CHACHA20POLY1305IETF;
+         }
+     }
+diff --git a/src/crypto.c b/src/crypto.c
+index d8a554e..8295930 100644
+--- a/src/crypto.c
++++ b/src/crypto.c
+@@ -105,7 +105,7 @@ crypto_md5(const unsigned char *d, size_t n, unsigned char *md)
+     }
+ #if MBEDTLS_VERSION_NUMBER < 0x03000000 && MBEDTLS_VERSION_NUMBER >= 0x02070000
+     if (mbedtls_md5_ret(d, n, md) != 0)
+-        FATAL("Failed to calculate MD5");
++        FATAL("[crypto] failed to calculate MD5");
+ #else
+     mbedtls_md5(d, n, md);
+ #endif
+@@ -121,7 +121,7 @@ entropy_check(void)
+ 
+     if ((fd = open("/dev/random", O_RDONLY)) != -1) {
+         if (ioctl(fd, RNDGETENTCNT, &c) == 0 && c < 160) {
+-            LOGI("This system doesn't provide enough entropy to quickly generate high-quality random numbers.\n"
++            LOGI("[crypto] This system doesn't provide enough entropy to quickly generate high-quality random numbers.\n"
+                  "Installing the rng-utils/rng-tools, jitterentropy or haveged packages may help.\n"
+                  "On virtualized Linux environments, also consider using virtio-rng.\n"
+                  "The service will not start until enough entropy has been collected.\n");
+@@ -139,7 +139,7 @@ crypto_init(const char *password, const char *key, const char *method)
+     entropy_check();
+     // Initialize sodium for random generator
+     if (sodium_init() == -1) {
+-        FATAL("Failed to initialize sodium");
++        FATAL("[crypto] failed to initialize sodium");
+     }
+ 
+     // Initialize NONCE bloom filter
+@@ -152,7 +152,7 @@ crypto_init(const char *password, const char *key, const char *method)
+                 break;
+             }
+         if (m != -1) {
+-            LOGI("Stream ciphers are insecure, therefore deprecated, and should be almost always avoided.");
++            LOGI("[crypto] stream ciphers are insecure, therefore deprecated, and should be almost always avoided.");
+             cipher_t *cipher = stream_init(password, key, method);
+             if (cipher == NULL)
+                 return NULL;
+@@ -194,7 +194,7 @@ crypto_init(const char *password, const char *key, const char *method)
+         }
+     }
+ 
+-    LOGE("invalid cipher name: %s", method);
++    LOGE("[crypto] invalid cipher name: %s", method);
+     return NULL;
+ }
+ 
+@@ -206,7 +206,7 @@ crypto_derive_key(const char *pass, uint8_t *key, size_t key_len)
+ 
+     const digest_type_t *md = mbedtls_md_info_from_string("MD5");
+     if (md == NULL) {
+-        FATAL("MD5 Digest not found in crypto library");
++        FATAL("[crypto] MD5 Digest not found in crypto library");
+     }
+ 
+     mbedtls_md_context_t c;
+@@ -368,10 +368,10 @@ crypto_parse_key(const char *base64, uint8_t *key, size_t key_len)
+     char out_key[out_len];
+     rand_bytes(key, key_len);
+     base64_encode(out_key, out_len, key, key_len);
+-    LOGE("Invalid key for your chosen cipher!");
+-    LOGE("It requires a " SIZE_FMT "-byte key encoded with URL-safe Base64", key_len);
+-    LOGE("Generating a new random key: %s", out_key);
+-    FATAL("Please use the key above or input a valid key");
++    LOGE("[crypto] Invalid key for your chosen cipher!");
++    LOGE("[crypto] It requires a " SIZE_FMT "-byte key encoded with URL-safe Base64", key_len);
++    LOGE("[crypto] Generating a new random key: %s", out_key);
++    FATAL("[crypto] Please use the key above or input a valid key");
+     return key_len;
+ }
+ 
+diff --git a/src/jconf.c b/src/jconf.c
+index c75a3ae..4a7769b 100644
+--- a/src/jconf.c
++++ b/src/jconf.c
+@@ -49,8 +49,8 @@ to_string(const json_value *value)
+     } else if (value->type == json_null) {
+         return NULL;
+     } else {
+-        LOGE("%d", value->type);
+-        FATAL("Invalid config format.");
++        LOGE("[jconf] %d", value->type);
++        FATAL("[jconf] invalid config format.");
+     }
+     return 0;
+ }
+@@ -148,7 +148,7 @@ parse_dscp(char *str)
+         return dscp;
+     }
+ 
+-    LOGE("Invalid DSCP value (%s)", str);
++    LOGE("[jconf] invalid DSCP value (%s)", str);
+     return DSCP_DEFAULT;
+ }
+ 
+@@ -167,7 +167,7 @@ read_jconf(const char *file)
+ 
+     FILE *f = fopen(file, "rb");
+     if (f == NULL) {
+-        FATAL("Invalid config path.");
++        FATAL("[jconf] invalid config path.");
+     }
+ 
+     fseek(f, 0, SEEK_END);
+@@ -175,21 +175,21 @@ read_jconf(const char *file)
+     fseek(f, 0, SEEK_SET);
+ 
+     if (pos < 0) {
+-        FATAL("Invalid config path.");
++        FATAL("[jconf] invalid config path.");
+     }
+ 
+     if (pos >= MAX_CONF_SIZE) {
+-        FATAL("Too large config file.");
++        FATAL("[jconf] too large config file.");
+     }
+ 
+     buf = ss_malloc(pos + 1);
+     if (buf == NULL) {
+-        FATAL("No enough memory.");
++        FATAL("[jconf] no enough memory.");
+     }
+ 
+     int nread = fread(buf, pos, 1, f);
+     if (!nread) {
+-        FATAL("Failed to read the config file.");
++        FATAL("[jconf] failed to read the config file.");
+     }
+     fclose(f);
+ 
+@@ -294,7 +294,7 @@ read_jconf(const char *file)
+                                       "invalid config file: option 'tcp_outgoing_rcvbuf' must be an integer");
+                 conf.tcp_outgoing_rcvbuf = value->u.integer;
+             } else if (strcmp(name, "auth") == 0) {
+-                FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
++                FATAL("[jconf] one time auth has been deprecated. Try AEAD ciphers instead.");
+             } else if (strcmp(name, "nofile") == 0) {
+                 check_json_value_type(value, json_integer,
+                                       "invalid config file: option 'nofile' must be an integer");
+@@ -330,7 +330,7 @@ read_jconf(const char *file)
+                 else if (strcmp(mode_str, "udp_only") == 0)
+                     conf.mode = UDP_ONLY;
+                 else
+-                    LOGI("ignore unknown mode: %s, use tcp_only as fallback",
++                    LOGI("[jconf] ignore unknown mode: %s, use tcp_only as fallback",
+                          mode_str);
+ 
+                 ss_free(mode_str);
+@@ -401,7 +401,7 @@ read_jconf(const char *file)
+             }
+         }
+     } else {
+-        FATAL("Invalid config file");
++        FATAL("[jconf] invalid config file");
+     }
+ 
+     ss_free(buf);
+diff --git a/src/metrics.c b/src/metrics.c
+index b36e1de..4af25fa 100644
+--- a/src/metrics.c
++++ b/src/metrics.c
+@@ -253,7 +253,7 @@ metrics_init(EV_P_ const char *addr, uint16_t port, int remote_num, time_t start
+ 
+     metrics_fd = socket(AF_INET, SOCK_STREAM, 0);
+     if (metrics_fd == -1) {
+-        ERROR("metrics: socket");
++        ERROR("[metrics] failed to create socket");
+         return;
+     }
+ 
+@@ -266,21 +266,21 @@ metrics_init(EV_P_ const char *addr, uint16_t port, int remote_num, time_t start
+     sock_addr.sin_family = AF_INET;
+     sock_addr.sin_port = htons(port);
+     if (inet_pton(AF_INET, addr, &sock_addr.sin_addr) <= 0) {
+-        ERROR("metrics: inet_pton");
++        ERROR("[metrics] inet_pton");
+         close(metrics_fd);
+         metrics_fd = -1;
+         return;
+     }
+ 
+     if (bind(metrics_fd, (struct sockaddr *)&sock_addr, sizeof(sock_addr)) != 0) {
+-        ERROR("metrics: bind");
++        ERROR("[metrics] bind");
+         close(metrics_fd);
+         metrics_fd = -1;
+         return;
+     }
+ 
+     if (listen(metrics_fd, SOMAXCONN) != 0) {
+-        ERROR("metrics: listen");
++        ERROR("[metrics] listen");
+         close(metrics_fd);
+         metrics_fd = -1;
+         return;
+@@ -289,7 +289,7 @@ metrics_init(EV_P_ const char *addr, uint16_t port, int remote_num, time_t start
+     ev_io_init(&metrics_watcher, metrics_accept_cb, metrics_fd, EV_READ);
+     ev_io_start(EV_A_ &metrics_watcher);
+ 
+-    LOGI("Metrics server started on %s:%d", addr, port);
++    LOGI("[metrics] metrics server started on %s:%d", addr, port);
+ }
+ 
+ void
+diff --git a/src/netutils.c b/src/netutils.c
+index af41624..88de888 100644
+--- a/src/netutils.c
++++ b/src/netutils.c
+@@ -172,7 +172,7 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+         size_t in_addr_len = sizeof(struct in_addr);
+         /* need: 1 (atyp) + in_addr_len + 2 (port) */
+         if (!REMAIN_AT_LEAST(in_addr_len + 2)) {
+-            LOGE("[udp] parse header: IPv4 header too short");
++            LOGE("parse header: IPv4 header too short");
+             return 0;
+         }
+         if (storage != NULL) {
+@@ -191,18 +191,18 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+     } else if ((atyp & ADDRTYPE_MASK) == 3) {
+         /* Domain name */
+         if (!REMAIN_AT_LEAST(1)) {
+-            LOGE("[udp] parse header: domain length byte missing");
++            LOGE("parse header: domain length byte missing");
+             return 0;
+         }
+         uint8_t name_len = *(const uint8_t *)(buf + offset);
+         /* total needed: 1 (atyp) + 1 (name_len) + name_len + 2 (port) */
+         if (!REMAIN_AT_LEAST(1 + name_len + 2)) {
+-            LOGE("[udp] parse header: domain header too short (name_len=%d, buf_len=%zu)", name_len, buf_len);
++            LOGE("parse header: domain header too short (name_len=%d, buf_len=%zu)", name_len, buf_len);
+             return 0;
+         }
+         /* guard tmp buffer size */
+         if (name_len >= MAX_HOSTNAME_LEN) {
+-            LOGE("[udp] parse header: domain name too long (%d >= %d)", name_len, MAX_HOSTNAME_LEN);
++            LOGE("parse header: domain name too long (%d >= %d)", name_len, MAX_HOSTNAME_LEN);
+             return 0;
+         }
+ 
+@@ -219,7 +219,7 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+                     memset(addr, 0, sizeof(*addr));
+                     addr->sin_family = AF_INET;
+                     if (inet_pton(AF_INET, tmp, &(addr->sin_addr)) <= 0) {
+-                        LOGE("[udp] inet_pton failed for %s", tmp);
++                        LOGE("inet_pton failed for %s", tmp);
+                     }
+                     memcpy(&addr->sin_port, buf + offset + 1 + name_len, sizeof(uint16_t));
+                 } else if (ip.version == 6) {
+@@ -227,7 +227,7 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+                     memset(addr6, 0, sizeof(*addr6));
+                     addr6->sin6_family = AF_INET6;
+                     if (inet_pton(AF_INET6, tmp, &(addr6->sin6_addr)) <= 0) {
+-                        LOGE("[udp] inet_pton failed for %s", tmp);
++                        LOGE("inet_pton failed for %s", tmp);
+                     }
+                     memcpy(&addr6->sin6_port, buf + offset + 1 + name_len, sizeof(uint16_t));
+                 } else {
+@@ -250,7 +250,7 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+         size_t in6_addr_len = sizeof(struct in6_addr);
+         /* need: 1 (atyp) + in6_addr_len + 2 (port) */
+         if (!REMAIN_AT_LEAST(in6_addr_len + 2)) {
+-            LOGE("[udp] parse header: IPv6 header too short");
++            LOGE("parse header: IPv6 header too short");
+             return 0;
+         }
+         if (storage != NULL) {
+@@ -266,13 +266,13 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
+         }
+         offset += in6_addr_len + 2;
+     } else {
+-        LOGE("[udp] parse header: unknown atyp %d", atyp);
++        LOGE("parse header: unknown atyp %d", atyp);
+         return 0;
+     }
+ 
+     /* final sanity */
+     if (offset <= 1 || (size_t)offset > buf_len) {
+-        LOGE("[udp] invalid header parsing result (offset=%d, buf_len=%zu)", offset, buf_len);
++        LOGE("invalid header parsing result (offset=%d, buf_len=%zu)", offset, buf_len);
+         return 0;
+     }
+ 
+diff --git a/src/plugin.c b/src/plugin.c
+index 4dba96c..25d1cfc 100644
+--- a/src/plugin.c
++++ b/src/plugin.c
+@@ -162,7 +162,7 @@ start_obfsproxy(const char *plugin,
+     if (plugin_opts != NULL) {
+         opts_dump = strndup(plugin_opts, OBFSPROXY_OPTS_MAX);
+         if (!opts_dump) {
+-            ERROR("start_obfsproxy strndup failed");
++            ERROR("[plugin] start_obfsproxy strndup failed");
+             if (env != NULL) {
+                 cork_env_free(env);
+             }
+@@ -306,7 +306,7 @@ stop_plugin()
+     if (sub != NULL) {
+         cork_subprocess_abort(sub);
+         if (cork_subprocess_wait(sub) == -1) {
+-            LOGI("error on terminating the plugin.");
++            LOGI("[plugin] error on terminating the plugin.");
+         }
+         cork_subprocess_free(sub);
+     }
+diff --git a/src/probe.c b/src/probe.c
+index dcc4d8d..c7f5232 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -150,7 +150,7 @@ static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
+ 
+         if (!p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
+             udp_probe_success_count[p_ctx->remote_idx] >= probe_up_threshold) {
+-            LOGI("[udp-probe] remote %d is back online after %d successful probes.", p_ctx->remote_idx, udp_probe_success_count[p_ctx->remote_idx]);
++            LOGI("[probe] remote %d is back online after %d successful probes.", p_ctx->remote_idx, udp_probe_success_count[p_ctx->remote_idx]);
+             p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = true;
+             metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, true);
+         }
+@@ -166,7 +166,7 @@ static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
+ 
+         if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
+             udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
+-            LOGI("[udp-probe] remote %d is offline after %d failed probes.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
++            LOGI("[probe] remote %d is offline after %d failed probes.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
+             p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
+             metrics_inc_remote_probe_failures_total(p_ctx->remote_idx, addr_str);
+             metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, false);
+@@ -187,7 +187,7 @@ static void udp_probe_timeout_cb(EV_P_ ev_timer *w, int revents) {
+     const char *addr_str = get_addr_str(p_ctx->server_ctx->remote_addr[p_ctx->remote_idx], true);
+     if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
+         udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
+-        LOGI("[udp-probe] remote %d is offline after %d probe timeouts.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
++        LOGI("[probe] remote %d is offline after %d probe timeouts.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
+         p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
+         metrics_set_remote_server_up(p_ctx->remote_idx, addr_str, false);
+         metrics_inc_remote_probe_failures_total(p_ctx->remote_idx, addr_str);
+@@ -216,7 +216,7 @@ static void start_one_udp_probe(EV_P_ server_ctx_t *s_ctx, int idx) {
+ 
+     struct sockaddr_storage dns_server_addr;
+     if (get_sockaddr("8.8.8.8", "53", &dns_server_addr, 1, 0) != 0) {
+-        LOGE("[udp-probe] failed to resolve 8.8.8.8:53");
++        LOGE("[probe] failed to resolve 8.8.8.8:53");
+         close(probefd);
+         return;
+     }
+diff --git a/src/redir.c b/src/redir.c
+index 252380c..f4aa4d7 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -157,12 +157,12 @@ create_and_bind(const char *addr, const char *port)
+ 
+     s = getaddrinfo(addr, port, &hints, &result);
+     if (s != 0) {
+-        LOGI("getaddrinfo: %s", gai_strerror(s));
++        LOGI("[redir] getaddrinfo: %s", gai_strerror(s));
+         return -1;
+     }
+ 
+     if (result == NULL) {
+-        LOGE("Could not bind");
++        LOGE("[redir] Could not bind");
+         return -1;
+     }
+ 
+@@ -180,7 +180,7 @@ create_and_bind(const char *addr, const char *port)
+         if (reuse_port) {
+             int err = set_reuseport(listen_sock);
+             if (err == 0) {
+-                LOGI("tcp port reuse enabled");
++                LOGI("[redir] tcp port reuse enabled");
+             }
+         }
+ 
+@@ -195,18 +195,29 @@ create_and_bind(const char *addr, const char *port)
+             }
+ 
+             if (setsockopt(listen_sock, level, optname, &opt, sizeof(opt)) != 0) {
+-                ERROR("setsockopt IP_TRANSPARENT");
++                ERROR("[redir] setsockopt IP_TRANSPARENT");
+                 exit(EXIT_FAILURE);
+             }
+-            LOGI("tcp tproxy mode enabled");
++            LOGI("[redir] tcp tproxy mode enabled");
+         }
+ 
+         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
+         if (s == 0) {
+-            /* We managed to bind successfully! */
+-            break;
++            if (listen(listen_sock, SOMAXCONN) == -1) {
++                ERROR("[redir] listen() error");
++                close(listen_sock);
++                continue;
++            }
++            setnonblocking(listen_sock);
++
++            ev_io *listen_io = ss_malloc(sizeof(ev_io));
++            listen_io->data = listener;
++            ev_io_init(listen_io, accept_cb, listen_sock, EV_READ);
++            ev_io_start(EV_A_ listen_io);
++            n++;
+         } else {
+-            ERROR("bind");
++            ERROR("[redir] bind");
++            close(listen_sock);
+         }
+ 
+         close(listen_sock);
+@@ -241,7 +252,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+             // continue to wait for recv
+             return;
+         } else {
+-            ERROR("server recv");
++            ERROR("[redir] server recv");
+             close_and_free_remote(EV_A_ remote);
+             close_and_free_server(EV_A_ server);
+             return;
+@@ -266,7 +277,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+             port = ntohs(sa->sin6_port);
+         }
+ 
+-        LOGI("redir to %s:%d, len=%zu, recv=%zd", ipstr, port, remote->buf->len, r);
++        LOGI("[redir] redir to %s:%d, len=%zu, recv=%zd", ipstr, port, remote->buf->len, r);
+     }
+ 
+     if (!remote->send_ctx->connected) {
+@@ -278,7 +289,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     int err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
+ 
+     if (err) {
+-        LOGE("invalid password or cipher");
++        LOGE("[redir] invalid password or cipher");
+         close_and_free_remote(EV_A_ remote);
+         close_and_free_server(EV_A_ server);
+         return;
+@@ -294,7 +305,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+             ev_io_start(EV_A_ & remote->send_ctx->io);
+             return;
+         } else {
+-            ERROR("send");
++            ERROR("[redir] send");
+             close_and_free_remote(EV_A_ remote);
+             close_and_free_server(EV_A_ server);
+             return;
+@@ -328,7 +339,7 @@ server_send_cb(EV_P_ ev_io *w, int revents)
+                          server->buf->len, 0);
+         if (s == -1) {
+             if (errno != EAGAIN && errno != EWOULDBLOCK) {
+-                ERROR("send");
++                ERROR("[redir] send");
+                 close_and_free_remote(EV_A_ remote);
+                 close_and_free_server(EV_A_ server);
+             }
+@@ -361,7 +372,7 @@ delayed_connect_cb(EV_P_ ev_timer *watcher, int revents)
+     remote->addr = NULL;
+ 
+     if (r == -1 && errno != CONNECT_IN_PROGRESS) {
+-        ERROR("connect");
++        ERROR("[redir] connect");
+         close_and_free_remote(EV_A_ remote);
+         close_and_free_server(EV_A_ server);
+         return;
+@@ -411,7 +422,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+             // continue to wait for recv
+             return;
+         } else {
+-            ERROR("remote recv");
++            ERROR("[redir] remote recv");
+             close_and_free_remote(EV_A_ remote);
+             close_and_free_server(EV_A_ server);
+             return;
+@@ -422,7 +433,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+     int err = crypto->decrypt(server->buf, server->d_ctx, SOCKET_BUF_SIZE);
+     if (err == CRYPTO_ERROR) {
+-        LOGE("invalid password or cipher");
++        LOGE("[redir] invalid password or cipher");
+         close_and_free_remote(EV_A_ remote);
+         close_and_free_server(EV_A_ server);
+         return;
+@@ -443,7 +454,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+             ev_io_stop(EV_A_ & remote_recv_ctx->io);
+             ev_io_start(EV_A_ & server->send_ctx->io);
+         } else {
+-            ERROR("send");
++            ERROR("[redir] send");
+             close_and_free_remote(EV_A_ remote);
+             close_and_free_server(EV_A_ server);
+             return;
+@@ -519,7 +530,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+ 
+             int err = crypto->encrypt(abuf, server->e_ctx, SOCKET_BUF_SIZE);
+             if (err) {
+-                LOGE("invalid password or cipher");
++                LOGE("[redir] invalid password or cipher");
+                 bfree(abuf);
+                 close_and_free_remote(EV_A_ remote);
+                 close_and_free_server(EV_A_ server);
+@@ -528,7 +539,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+ 
+             err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
+             if (err) {
+-                LOGE("invalid password or cipher");
++                LOGE("[redir] invalid password or cipher");
+                 bfree(abuf);
+                 close_and_free_remote(EV_A_ remote);
+                 close_and_free_server(EV_A_ server);
+@@ -538,7 +549,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+             bprepend(remote->buf, abuf, SOCKET_BUF_SIZE);
+             bfree(abuf);
+         } else {
+-            ERROR("getpeername");
++            ERROR("[redir] getpeername");
+             // not connected
+             handle_tcp_fail(EV_A_ server);
+             return;
+@@ -559,7 +570,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+             int optval = 1;
+             if (setsockopt(remote->fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT,
+                            (void *)&optval, sizeof(optval)) < 0)
+-                FATAL("failed to set TCP_FASTOPEN_CONNECT");
++                FATAL("[redir] failed to set TCP_FASTOPEN_CONNECT");
+             s = connect(remote->fd, remote->addr, get_sockaddr_len(remote->addr));
+             if (s == 0)
+                 s = send(remote->fd, remote->buf->data, remote->buf->len, 0);
+@@ -568,7 +579,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+                        remote->buf->len, MSG_FASTOPEN, remote->addr,
+                        get_sockaddr_len(remote->addr));
+ #else
+-            FATAL("tcp fast open is not supported on this platform");
++            FATAL("[redir] tcp fast open is not supported on this platform");
+ #endif
+ 
+             remote->addr = NULL;
+@@ -581,9 +592,9 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+                     if (errno == EOPNOTSUPP || errno == EPROTONOSUPPORT ||
+                         errno == ENOPROTOOPT) {
+                         fast_open = 0;
+-                        LOGE("fast open is not supported on this platform");
++                        LOGE("[redir] fast open is not supported on this platform");
+                     } else {
+-                        ERROR("fast_open_connect");
++                        ERROR("[redir] fast_open_connect");
+                     }
+                     handle_tcp_fail(EV_A_ server);
+                 }
+@@ -596,7 +607,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+ 
+         if (s == -1) {
+             if (errno != EAGAIN && errno != EWOULDBLOCK) {
+-                ERROR("send");
++                ERROR("[redir] send");
+                 /* close current remote and try next */
+                 handle_tcp_fail(EV_A_ server);
+             }
+@@ -757,7 +768,7 @@ handle_tcp_fail(EV_P_ server_t *server)
+      * The probing mechanism is now solely responsible for managing remote status.
+      * We just close the server connection and let the client retry.
+      */
+-    LOGE("TCP connection to remote %d failed, closing connection.", server->remote_idx);
++    LOGE("[redir] TCP connection to remote %d failed, closing connection.", server->remote_idx);
+     close_and_free_server(EV_A_ server);
+ }
+ 
+@@ -767,7 +778,7 @@ start_connect_remote(EV_P_ server_t *server)
+     listen_ctx_t *listener = server->listener;
+ 
+     if (server->remote_idx >= listener->remote_num) {
+-        LOGE("all remote servers failed to connect");
++        LOGE("[redir] all remote servers failed to connect");
+         handle_tcp_fail(EV_A_ server);
+         return;
+     }
+@@ -782,7 +793,7 @@ start_connect_remote(EV_P_ server_t *server)
+     }
+     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
+     if (remotefd == -1) {
+-        ERROR("[tcp] socket");
++        ERROR("[redir] tcp: socket");
+         handle_tcp_fail(EV_A_ server);
+         return;
+     }
+@@ -810,12 +821,12 @@ start_connect_remote(EV_P_ server_t *server)
+     if (listener->tos >= 0) {
+         int rc = setsockopt(remotefd, IPPROTO_IP, IP_TOS, &listener->tos, sizeof(listener->tos));
+         if (rc < 0 && errno != ENOPROTOOPT) {
+-            LOGE("setting ipv4 dscp failed: %d", errno);
++            ERROR("[redir] setting ipv4 dscp failed");
+         }
+ #ifdef IPV6_TCLASS
+         rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &listener->tos, sizeof(listener->tos));
+         if (rc < 0 && errno != ENOPROTOOPT) {
+-            LOGE("setting ipv6 dscp failed: %d", errno);
++            ERROR("[redir] setting ipv6 dscp failed");
+         }
+ #endif
+     }
+@@ -824,7 +835,7 @@ start_connect_remote(EV_P_ server_t *server)
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+         if (err == -1) {
+-            ERROR("[tcp] failed to enable out-of-tree multipath TCP");
++            ERROR("[redir] failed to enable out-of-tree multipath TCP");
+         }
+     } else if (listener->mptcp == 1) {
+         int i = 0;
+@@ -836,7 +847,7 @@ start_connect_remote(EV_P_ server_t *server)
+             i++;
+         }
+         if (listener->mptcp == 0) {
+-            ERROR("[tcp] failed to enable out-of-tree multipath TCP");
++            ERROR("[redir] failed to enable out-of-tree multipath TCP");
+         }
+     }
+ 
+@@ -851,7 +862,7 @@ start_connect_remote(EV_P_ server_t *server)
+ #ifdef SO_MARK
+     if (fwmark > 0) {
+         if (setsockopt(remotefd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark)) != 0) {
+-            ERROR("setsockopt SO_MARK");
++            ERROR("[redir] setsockopt SO_MARK");
+         }
+     }
+ #endif
+@@ -868,7 +879,7 @@ start_connect_remote(EV_P_ server_t *server)
+         int r = connect(remotefd, remote_addr, get_sockaddr_len(remote_addr));
+ 
+         if (r == -1 && errno != CONNECT_IN_PROGRESS) {
+-            ERROR("[tcp] connect");
++            ERROR("[redir] tcp: connect");
+             handle_tcp_fail(EV_A_ server);
+             return;
+         }
+@@ -890,13 +901,13 @@ accept_cb(EV_P_ ev_io *w, int revents)
+ 
+     int serverfd = accept(listener->fd, NULL, NULL);
+     if (serverfd == -1) {
+-        ERROR("[tcp] accept");
++        ERROR("[redir] tcp: accept");
+         return;
+     }
+ 
+     err = getdestaddr(serverfd, &destaddr);
+     if (err) {
+-        ERROR("[tcp] getdestaddr");
++        ERROR("[redir] tcp: getdestaddr");
+         return;
+     }
+ 
+@@ -930,7 +941,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+         }
+     }
+     if (start_idx == -1) {
+-        LOGE("No remote servers available, dropping connection.");
++        LOGE("[redir] no remote servers available, dropping connection.");
+         close(serverfd);
+         free_server(server);
+         return;
+@@ -949,7 +960,7 @@ signal_cb(EV_P_ ev_signal *w, int revents)
+         switch (w->signum) {
+         case SIGCHLD:
+             if (!is_plugin_running()) {
+-                LOGE("plugin service exit unexpectedly");
++                LOGE("[redir] plugin service exit unexpectedly");
+                 ret_val = -1;
+             } else
+                 return;
+@@ -1045,16 +1056,16 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_MTU:
+             mtu = atoi(optarg);
+-            LOGI("set MTU to %d", mtu);
++            LOGI("[redir] set MTU to %d", mtu);
+             break;
+         case GETOPT_VAL_MPTCP:
+             mptcp = get_mptcp(1);
+             if (mptcp)
+-                LOGI("enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
++                LOGI("[redir]enable multipath TCP (%s)", mptcp > 0 ? "out-of-tree" : "upstream");
+             break;
+         case GETOPT_VAL_NODELAY:
+             no_delay = 1;
+-            LOGI("enable TCP no-delay");
++            LOGI("[redir] enable TCP no-delay");
+             break;
+         case GETOPT_VAL_PLUGIN:
+             plugin = optarg;
+@@ -1067,7 +1078,7 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_FWMARK:
+             fwmark = atoi(optarg);
+-            LOGI("fwmark set to %d", fwmark);
++            LOGI("[redir] fwmark set to %d", fwmark);
+             break;
+         case GETOPT_VAL_PROBE_INTERVAL:
+             probe_interval = atoi(optarg);
+@@ -1161,11 +1172,11 @@ main(int argc, char **argv)
+             ipv6first = 1;
+             break;
+         case 'A':
+-            FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
++            FATAL("[redir] One time auth has been deprecated. Try AEAD ciphers instead.");
+             break;
+         case '?':
+             // The option character is not recognized.
+-            LOGE("Unrecognized option: %s", optarg);
++            LOGE("[redir] Unrecognized option: %s", optarg);
+             opterr = 1;
+             break;
+         }
+@@ -1264,7 +1275,7 @@ main(int argc, char **argv)
+         dscp     = conf->dscp;
+         if (fwmark == 0 && conf->fwmark > 0) {
+             fwmark = conf->fwmark;
+-            LOGI("set firewall mark to %d", fwmark);
++            LOGI("[redir] set firewall mark to %d", fwmark);
+         }
+         if (probe_interval == 0) {
+             probe_interval = conf->probe_interval;
+@@ -1295,7 +1306,7 @@ main(int argc, char **argv)
+     if (plugin != NULL) {
+         uint16_t port = get_local_port();
+         if (port == 0) {
+-            FATAL("failed to find a free port");
++            FATAL("[redir] failed to find a free port");
+         }
+         snprintf(tmp_port, 8, "%d", port);
+         if (is_ipv6only(remote_addr, remote_num, ipv6first)) {
+@@ -1305,7 +1316,7 @@ main(int argc, char **argv)
+         }
+         plugin_port = tmp_port;
+ 
+-        LOGI("plugin \"%s\" enabled", plugin);
++        LOGI("[redir] plugin \"%s\" enabled", plugin);
+     }
+ 
+     if (method == NULL) {
+@@ -1323,7 +1334,7 @@ main(int argc, char **argv)
+      */
+     if (nofile > 1024) {
+         if (verbose) {
+-            LOGI("setting NOFILE to %d", nofile);
++            LOGI("[redir] setting NOFILE to %d", nofile);
+         }
+         set_nofile(nofile);
+     }
+@@ -1339,9 +1350,9 @@ main(int argc, char **argv)
+ 
+     if (fast_open == 1) {
+ #ifdef TCP_FASTOPEN
+-        LOGI("using tcp fast open");
++        LOGI("[redir] using tcp fast open");
+ #else
+-        LOGE("tcp fast open is not supported by this environment");
++        LOGE("[redir] tcp fast open is not supported by this environment");
+         fast_open = 0;
+ #endif
+     }
+@@ -1352,11 +1363,11 @@ main(int argc, char **argv)
+     }
+ 
+     if (no_delay) {
+-        LOGI("enable TCP no-delay");
++        LOGI("[redir] enable TCP no-delay");
+     }
+ 
+     if (ipv6first) {
+-        LOGI("resolving hostname to IPv6 address first");
++        LOGI("[redir] resolving hostname to IPv6 address first");
+     }
+ 
+     if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+@@ -1404,7 +1415,7 @@ main(int argc, char **argv)
+         int err = start_plugin(plugin, plugin_opts, remote_str,
+                                remote_port, plugin_host, plugin_port, MODE_CLIENT);
+         if (err) {
+-            FATAL("failed to start the plugin");
++            FATAL("[redir] failed to start the plugin");
+         }
+     }
+ 
+@@ -1445,10 +1456,10 @@ main(int argc, char **argv)
+     const char *metrics_addr = "0.0.0.0";
+     metrics_init(EV_A_ metrics_addr, metrics_port, remote_num, start_time);
+ 
+-    LOGI("initializing ciphers... %s", method);
++    LOGI("[redir] initializing ciphers... %s", method);
+     crypto = crypto_init(password, key, method);
+     if (crypto == NULL)
+-        FATAL("failed to initialize ciphers");
++        FATAL("[redir] failed to initialize ciphers");
+ 
+     /* Setup proxy context */
+     struct listen_ctx listen_ctx;
+@@ -1470,7 +1481,7 @@ main(int argc, char **argv)
+         struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
+         memset(storage, 0, sizeof(struct sockaddr_storage));
+         if (get_sockaddr(host, port, storage, 1, ipv6first) == -1) {
+-            FATAL("failed to resolve the provided hostname");
++            FATAL("[redir] failed to resolve the provided hostname");
+         }
+         listen_ctx.remote_addr[i] = (struct sockaddr *)storage;
+ 
+@@ -1504,19 +1515,10 @@ main(int argc, char **argv)
+                 LOGI("listening at %s:%s", local_addr, local_port);
+             }
+ 
+-            int listenfd = create_and_bind(local_addr, local_port);
+-            if (listenfd == -1) FATAL("bind() error");
+-            if (listen(listenfd, SOMAXCONN) == -1) FATAL("listen() error");
+-            setnonblocking(listenfd);
+-
+-            listen_ctx_current->fd = listenfd;
+-            ev_io_init(&listen_ctx_current->io, accept_cb, listenfd, EV_READ);
+-            ev_io_start(loop, &listen_ctx_current->io);
+-
+             if (listen_ctx_count < MAX_LISTEN_CTX) {
+                 listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
+             } else {
+-                LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
++                LOGE("[redir] too many listen ctx; increase MAX_LISTEN_CTX");
+             }
+ 
+             /* Handle additional TOS/DSCP listening ports */
+@@ -1527,18 +1529,25 @@ main(int argc, char **argv)
+                 new_lc->tos = dscp[dscp_num - 1].dscp << 2;
+                 listen_ctx_current = new_lc;
+             }
+-        } while (dscp_num-- > 0);
++        } while (dscp_num-- > 0 && listen_ctx_current != NULL);
++
++        /* Now, create sockets for all configured listeners */
++        for (i = 0; i < listen_ctx_count; i++) {
++            if (create_and_bind(EV_A_ NULL, local_port, listen_ctx_list[i]) == -1) {
++                FATAL("[redir] bind() error");
++            }
++        }
+     } else {
+-        LOGI("TCP relay disabled");
++        LOGI("[redir] TCP relay disabled");
+     }
+ 
+     /* setuid */
+     if (user != NULL && !run_as(user)) {
+-        FATAL("failed to switch user");
++        FATAL("[redir] failed to switch user");
+     }
+ 
+     if (geteuid() == 0) {
+-        LOGI("running from root user");
++        LOGI("[redir] running from root user");
+     }
+ 
+     ev_run(loop, 0);
+diff --git a/src/stream.c b/src/stream.c
+index 1f4d06a..d803452 100644
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -172,7 +172,7 @@ const cipher_kt_t *
+ stream_get_cipher_type(int method)
+ {
+     if (method <= TABLE || method >= STREAM_CIPHER_NUM) {
+-        LOGE("stream_get_cipher_type(): Illegal method");
++        LOGE("[stream] stream_get_cipher_type(): Illegal method");
+         return NULL;
+     }
+ 
+@@ -187,7 +187,7 @@ stream_get_cipher_type(int method)
+     const char *ciphername  = supported_stream_ciphers[method];
+     const char *mbedtlsname = supported_stream_ciphers_mbedtls[method];
+     if (strcmp(mbedtlsname, CIPHER_UNSUPPORTED) == 0) {
+-        LOGE("Cipher %s currently is not supported by mbed TLS library",
++        LOGE("[stream] cipher %s currently is not supported by mbed TLS library",
+              ciphername);
+         return NULL;
+     }
+@@ -198,7 +198,7 @@ void
+ stream_cipher_ctx_init(cipher_ctx_t *ctx, int method, int enc)
+ {
+     if (method <= TABLE || method >= STREAM_CIPHER_NUM) {
+-        LOGE("stream_ctx_init(): Illegal method");
++        LOGE("[stream] stream_ctx_init(): Illegal method");
+         return;
+     }
+ 
+@@ -214,12 +214,12 @@ stream_cipher_ctx_init(cipher_ctx_t *ctx, int method, int enc)
+     cipher_evp_t *evp = ctx->evp;
+ 
+     if (cipher == NULL) {
+-        LOGE("Cipher %s not found in mbed TLS library", ciphername);
+-        FATAL("Cannot initialize mbed TLS cipher");
++        LOGE("[stream] cipher %s not found in mbed TLS library", ciphername);
++        FATAL("[stream] cannot initialize mbed TLS cipher");
+     }
+     mbedtls_cipher_init(evp);
+     if (mbedtls_cipher_setup(evp, cipher) != 0) {
+-        FATAL("Cannot initialize mbed TLS cipher context");
++        FATAL("[stream] cannot initialize mbed TLS cipher context");
+     }
+ }
+ 
+@@ -249,7 +249,7 @@ cipher_ctx_set_nonce(cipher_ctx_t *cipher_ctx, uint8_t *nonce, size_t nonce_len,
+     cipher_t *cipher = cipher_ctx->cipher;
+ 
+     if (nonce == NULL) {
+-        LOGE("cipher_ctx_set_nonce(): NONCE is null");
++        LOGE("[stream] cipher_ctx_set_nonce(): NONCE is null");
+         return;
+     }
+ 
+@@ -269,20 +269,20 @@ cipher_ctx_set_nonce(cipher_ctx_t *cipher_ctx, uint8_t *nonce, size_t nonce_len,
+ 
+     cipher_evp_t *evp = cipher_ctx->evp;
+     if (evp == NULL) {
+-        LOGE("cipher_ctx_set_nonce(): Cipher context is null");
++        LOGE("[stream] cipher_ctx_set_nonce(): Cipher context is null");
+         return;
+     }
+     if (mbedtls_cipher_setkey(evp, true_key, cipher->key_len * 8, enc) != 0) {
+         mbedtls_cipher_free(evp);
+-        FATAL("Cannot set mbed TLS cipher key");
++        FATAL("[stream] cannot set mbed TLS cipher key");
+     }
+     if (mbedtls_cipher_set_iv(evp, nonce, nonce_len) != 0) {
+         mbedtls_cipher_free(evp);
+-        FATAL("Cannot set mbed TLS cipher NONCE");
++        FATAL("[stream] cannot set mbed TLS cipher NONCE");
+     }
+     if (mbedtls_cipher_reset(evp) != 0) {
+         mbedtls_cipher_free(evp);
+-        FATAL("Cannot finalize mbed TLS cipher context");
++        FATAL("[stream] cannot finalize mbed TLS cipher context");
+     }
+ 
+ #ifdef SS_DEBUG
+@@ -437,7 +437,7 @@ stream_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
+     memcpy(nonce, ciphertext->data, nonce_len);
+ 
+     if (ppbloom_check((void *)nonce, nonce_len) == 1) {
+-        LOGE("crypto: stream: repeat IV detected");
++        LOGE("[stream] crypto: stream: repeat IV detected");
+         return CRYPTO_ERROR;
+     }
+ 
+@@ -522,7 +522,7 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
+ 
+         if (cipher->method >= RC4_MD5) {
+             if (ppbloom_check((void *)nonce, nonce_len) == 1) {
+-                LOGE("crypto: stream: repeat IV detected");
++                LOGE("[stream] crypto: stream: repeat IV detected");
+                 return CRYPTO_ERROR;
+             }
+         }
+@@ -569,7 +569,7 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
+     if (cipher_ctx->init == 1) {
+         if (cipher->method >= RC4_MD5) {
+             if (ppbloom_check((void *)cipher_ctx->nonce, cipher->nonce_len) == 1) {
+-                LOGE("crypto: stream: repeat IV detected");
++                LOGE("[stream] crypto: stream: repeat IV detected");
+                 return CRYPTO_ERROR;
+             }
+             ppbloom_add((void *)cipher_ctx->nonce, cipher->nonce_len);
+@@ -600,7 +600,7 @@ cipher_t *
+ stream_key_init(int method, const char *pass, const char *key)
+ {
+     if (method <= TABLE || method >= STREAM_CIPHER_NUM) {
+-        LOGE("cipher->key_init(): Illegal method");
++        LOGE("[stream] cipher->key_init(): Illegal method");
+         return NULL;
+     }
+ 
+@@ -608,8 +608,8 @@ stream_key_init(int method, const char *pass, const char *key)
+     memset(cipher, 0, sizeof(cipher_t));
+ 
+     if (method < SALSA20 && stream_get_cipher_type(method) == NULL) {
+-        LOGE("Cipher %s not found in crypto library", supported_stream_ciphers[method]);
+-        FATAL("Cannot initialize cipher");
++        LOGE("[stream] cipher %s not found in crypto library", supported_stream_ciphers[method]);
++        FATAL("[stream] cannot initialize cipher");
+     }
+ 
+     if (key != NULL)
+@@ -620,7 +620,7 @@ stream_key_init(int method, const char *pass, const char *key)
+                                             supported_stream_ciphers_key_size[method]);
+ 
+     if (cipher->key_len == 0) {
+-        FATAL("Cannot generate key and NONCE");
++        FATAL("[stream] cannot generate key and NONCE");
+     }
+     cipher->nonce_len = supported_stream_ciphers_nonce_size[method];
+     cipher->method = method;
+@@ -638,12 +638,12 @@ stream_init(const char *pass, const char *key, const char *method)
+                 break;
+             }
+         if (m >= STREAM_CIPHER_NUM) {
+-            LOGE("Invalid cipher name: %s, use chacha20-ietf instead", method);
++            LOGE("[stream] invalid cipher name: %s, use chacha20-ietf instead", method);
+             m = CHACHA20IETF;
+         }
+     }
+     if (m == TABLE) {
+-        LOGE("Table is deprecated");
++        LOGE("[stream] table is deprecated");
+         return NULL;
+     }
+     return stream_key_init(m, pass, key);
+diff --git a/src/udprelay.c b/src/udprelay.c
+index 1702d1d..3fc4cef 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -425,15 +425,15 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+     }
+ 
+     if (remote_ctx->state == STATE_AWAITING_REPLY) {
+-        LOGI("[udp] session timed out waiting for reply from remote %d.", remote_ctx->remote_idx);
++        LOGI("[udprelay] session timed out waiting for reply from remote %d.", remote_ctx->remote_idx);
+         const char *addr_str = get_addr_str(server_ctx->remote_addr[remote_ctx->remote_idx], true);
+         metrics_inc_remote_udp_session_timeouts_total(remote_ctx->remote_idx, addr_str);
+     } else {
+-        if (verbose) LOGI("[udp] idle session timed out.");
++        if (verbose) LOGI("[udprelay] idle session timed out.");
+     }
+ 
+     if (verbose) {
+-        LOGI("[udp] connection timeout for src %s", get_addr_str((struct sockaddr *)&remote_ctx->src_addr, true));
++        LOGI("[udprelay] connection timeout for src %s", get_addr_str((struct sockaddr *)&remote_ctx->src_addr, true));
+     }
+ 
+     /* 使用栈上的 key 以移除 cache 条目（触发 free_cb） */
+diff --git a/src/utils.c b/src/utils.c
+index 5669713..ea4974f 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -143,22 +143,20 @@ run_as(const char *user)
+             if (err == 0 && pwd) {
+                 /* setgid first, because we may not be allowed to do it anymore after setuid */
+                 if (setgid(pwd->pw_gid) != 0) {
+-                    LOGE(
+-                        "Could not change group id to that of run_as user '%s': %s",
++                    LOGE("could not change group id to that of run_as user '%s': %s",
+                         pwd->pw_name, strerror(errno));
+                     return 0;
+                 }
+ 
+ #ifndef __CYGWIN__
+                 if (initgroups(pwd->pw_name, pwd->pw_gid) == -1) {
+-                    LOGE("Could not change supplementary groups for user '%s'.", pwd->pw_name);
++                    LOGE("could not change supplementary groups for user '%s'.", pwd->pw_name);
+                     return 0;
+                 }
+ #endif
+ 
+                 if (setuid(pwd->pw_uid) != 0) {
+-                    LOGE(
+-                        "Could not change user id to that of run_as user '%s': %s",
++                    LOGE("could not change user id to that of run_as user '%s': %s",
+                         pwd->pw_name, strerror(errno));
+                     return 0;
+                 }
+@@ -174,8 +172,7 @@ run_as(const char *user)
+             } else if (buflen >= 16 * 1024) {
+                 /* If getpwnam_r() seems defective, call it quits rather than
+                  * keep on allocating ever larger buffers until we crash. */
+-                LOGE(
+-                    "getpwnam_r() requires more than %u bytes of buffer space.",
++                LOGE("getpwnam_r() requires more than %u bytes of buffer space.",
+                     (unsigned)buflen);
+                 return 0;
+             }
+@@ -196,7 +193,7 @@ run_as(const char *user)
+             return 0;
+         }
+         if (initgroups(pwd->pw_name, pwd->pw_gid) == -1) {
+-            LOGE("Could not change supplementary groups for user '%s'.", pwd->pw_name);
++            LOGE("could not change supplementary groups for user '%s'.", pwd->pw_name);
+             return 0;
+         }
+         if (setuid(pwd->pw_uid) != 0) {
+@@ -464,14 +461,13 @@ set_nofile(int nofile)
+ 
+     if (setrlimit(RLIMIT_NOFILE, &limit) < 0) {
+         if (errno == EPERM) {
+-            LOGE(
+-                "insufficient permission to change NOFILE, not starting as root?");
++            LOGE("insufficient permission to change NOFILE, not starting as root?");
+             return -1;
+         } else if (errno == EINVAL) {
+             LOGE("invalid nofile, decrease nofile and try again");
+             return -1;
+         } else {
+-            LOGE("setrlimit failed: %s", strerror(errno));
++            ERROR("setrlimit failed");
+             return -1;
+         }
+     }
+-- 
+2.37.1 (Apple Git-137.1)
+

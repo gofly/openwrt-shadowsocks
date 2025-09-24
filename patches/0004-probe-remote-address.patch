@@ -1,0 +1,2521 @@
+From 334c1e0f9fd2e264508ab401603f0090e334d993 Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Tue, 23 Sep 2025 22:11:14 +0800
+Subject: [PATCH 4/8] probe remote address
+
+---
+ src/CMakeLists.txt |   1 +
+ src/Makefile.am    |   3 +-
+ src/common.h       |  10 +-
+ src/jconf.c        |  24 +-
+ src/jconf.h        |   6 +-
+ src/netutils.c     | 163 +++++++++++
+ src/netutils.h     |   4 +
+ src/probe.c        | 311 ++++++++++++++++++++
+ src/probe.h        |  32 +++
+ src/redir.c        | 370 ++++++++++++++++--------
+ src/redir.h        |  15 +-
+ src/stream.c       |   1 -
+ src/udprelay.c     | 695 +++++++++++++++++++--------------------------
+ src/udprelay.h     |  14 +-
+ src/utils.c        |  20 ++
+ src/utils.h        |   1 +
+ 16 files changed, 1131 insertions(+), 539 deletions(-)
+ create mode 100644 src/probe.c
+ create mode 100644 src/probe.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 65f44fb..eb76252 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -25,6 +25,7 @@ set(SS_SHARED_SOURCES
+ set(SS_REDIR_SOURCE
+         ${SS_SHARED_SOURCES}
+         udprelay.c
++        probe.c
+         cache.c
+         redir.c
+         ${SS_CRYPTO_SOURCE}
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 995f1cd..1d2a6e6 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -34,6 +34,7 @@ ss_redir_SOURCES = utils.c \
+                    netutils.c \
+                    cache.c \
+                    udprelay.c \
++                   probe.c \
+                    redir.c \
+                    $(crypto_src) \
+                    $(plugin_src)
+@@ -44,4 +45,4 @@ ss_redir_LDADD += -lcares
+ 
+ noinst_HEADERS = crypto.h stream.h aead.h json.h netutils.h redir.h uthash.h \
+                  cache.h plugin.h utils.h base64.h ppbloom.h \
+-                 common.h jconf.h udprelay.h
++                 common.h jconf.h udprelay.h probe.h
+diff --git a/src/common.h b/src/common.h
+index d45d773..96d6d42 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -29,8 +29,9 @@
+ #include "crypto.h"
+ 
+ int init_udprelay(const char *server_host, const char *server_port,
+-                  const struct sockaddr *remote_addr, const int remote_addr_len,
+-                  int mtu, crypto_t *crypto, int timeout, const char *iface, int fwmark);
++                  int remote_num, struct sockaddr **remote_addr, int mtu,
++                  crypto_t *crypto, int timeout, const char *iface, int fwmark,
++                  volatile bool *remote_status);
+ 
+ void free_udprelay(void);
+ 
+@@ -58,6 +59,11 @@ enum {
+     GETOPT_VAL_TCP_OUTGOING_SNDBUF,
+     GETOPT_VAL_TCP_OUTGOING_RCVBUF,
+     GETOPT_VAL_FWMARK,
++    GETOPT_VAL_PROBE_INTERVAL,
++    GETOPT_VAL_PROBE_TIMEOUT,
++    GETOPT_VAL_PROBE_UP_COUNT,
++    GETOPT_VAL_PROBE_DOWN_COUNT,
++    GETOPT_VAL_PROBE_DOMAIN,
+ };
+ 
+ #endif // _COMMON_H
+diff --git a/src/jconf.c b/src/jconf.c
+index e72bc8b..1d3a77b 100644
+--- a/src/jconf.c
++++ b/src/jconf.c
+@@ -318,8 +318,6 @@ read_jconf(const char *file)
+                         }
+                     }
+                 }
+-            } else if (strcmp(name, "tunnel_address") == 0) {
+-                conf.tunnel_address = to_string(value);
+             } else if (strcmp(name, "mode") == 0) {
+                 char *mode_str = to_string(value);
+ 
+@@ -371,6 +369,28 @@ read_jconf(const char *file)
+                     value, json_integer,
+                     "invalid config file: option 'fwmark' must be an integer");
+                 conf.fwmark = value->u.integer;
++            } else if (strcmp(name, "probe_interval") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'probe_interval' must be an integer");
++                conf.probe_interval = value->u.integer;
++            } else if (strcmp(name, "probe_timeout") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'probe_timeout' must be an integer");
++                conf.probe_timeout = value->u.integer;
++            } else if (strcmp(name, "probe_up_count") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'probe_up_count' must be an integer");
++                conf.probe_up_count = value->u.integer;
++            } else if (strcmp(name, "probe_down_count") == 0) {
++                check_json_value_type(
++                    value, json_integer,
++                    "invalid config file: option 'probe_down_count' must be an integer");
++                conf.probe_down_count = value->u.integer;
++            } else if (strcmp(name, "probe_domain") == 0) {
++                conf.probe_domain = to_string(value);
+             } else if (strcmp(name, "acl") == 0) {
+                 conf.acl = to_string(value);
+             } else if (strcmp(name, "manager_address") == 0) {
+diff --git a/src/jconf.h b/src/jconf.h
+index 1955536..57674d9 100644
+--- a/src/jconf.h
++++ b/src/jconf.h
+@@ -80,7 +80,6 @@ typedef struct {
+     char *nameserver;
+     int dscp_num;
+     ss_dscp_t dscp[MAX_DSCP_NUM];
+-    char *tunnel_address;
+     int mode;
+     int mtu;
+     int mptcp;
+@@ -91,6 +90,11 @@ typedef struct {
+     char *acl;
+     char *manager_address;
+     int fwmark;
++    int probe_interval;
++    int probe_timeout;
++    int probe_up_count;
++    int probe_down_count;
++    char *probe_domain;
+ } jconf_t;
+ 
+ jconf_t *read_jconf(const char *file);
+diff --git a/src/netutils.c b/src/netutils.c
+index 7b32805..af41624 100644
+--- a/src/netutils.c
++++ b/src/netutils.c
+@@ -41,6 +41,7 @@
+ 
+ #include "netutils.h"
+ #include "utils.h"
++#include "crypto.h"
+ 
+ #ifndef SO_REUSEPORT
+ #define SO_REUSEPORT 15
+@@ -123,6 +124,168 @@ bind_to_addr(struct sockaddr_storage *storage,
+     return -1;
+ }
+ 
++int
++construct_udprelay_header(const struct sockaddr_storage *in_addr,
++                          char *addr_header)
++{
++    int addr_header_len = 0;
++
++    if (in_addr->ss_family == AF_INET) {
++        struct sockaddr_in *addr = (struct sockaddr_in *)in_addr;
++        size_t addr_len          = sizeof(struct in_addr);
++
++        addr_header[addr_header_len++] = 1;
++        memcpy(addr_header + addr_header_len, &addr->sin_addr, addr_len);
++        addr_header_len += addr_len;
++        memcpy(addr_header + addr_header_len, &addr->sin_port, 2);
++        addr_header_len += 2;
++    } else if (in_addr->ss_family == AF_INET6) {
++        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)in_addr;
++        size_t addr_len           = sizeof(struct in6_addr);
++
++        addr_header[addr_header_len++] = 4;
++        memcpy(addr_header + addr_header_len, &addr->sin6_addr, addr_len);
++        addr_header_len += addr_len;
++        memcpy(addr_header + addr_header_len, &addr->sin6_port, 2);
++        addr_header_len += 2;
++    } else {
++        return 0;
++    }
++
++    return addr_header_len;
++}
++
++int
++parse_udprelay_header(const char *buf, const size_t buf_len,
++                      char *host, char *port, struct sockaddr_storage *storage)
++{
++    if (buf == NULL || buf_len == 0) return 0;
++
++    const uint8_t atyp = *(const uint8_t *)buf;
++    int offset = 1;
++
++    /* helper to check remaining length */
++    #define REMAIN_AT_LEAST(x) ((size_t)(offset) + (size_t)(x) <= (buf_len))
++
++    if ((atyp & ADDRTYPE_MASK) == 1) {
++        /* IPv4 */
++        size_t in_addr_len = sizeof(struct in_addr);
++        /* need: 1 (atyp) + in_addr_len + 2 (port) */
++        if (!REMAIN_AT_LEAST(in_addr_len + 2)) {
++            LOGE("[udp] parse header: IPv4 header too short");
++            return 0;
++        }
++        if (storage != NULL) {
++            struct sockaddr_in *addr = (struct sockaddr_in *)storage;
++            addr->sin_family = AF_INET;
++            memcpy(&addr->sin_addr, buf + offset, in_addr_len);
++            memcpy(&addr->sin_port, buf + offset + in_addr_len, sizeof(uint16_t));
++        }
++        if (host != NULL) {
++            if (inet_ntop(AF_INET, (const void *)(buf + offset), host, INET_ADDRSTRLEN) == NULL) {
++                /* inet_ntop 失敗也不致命，但清空 host */
++                host[0] = '\0';
++            }
++        }
++        offset += in_addr_len + 2;
++    } else if ((atyp & ADDRTYPE_MASK) == 3) {
++        /* Domain name */
++        if (!REMAIN_AT_LEAST(1)) {
++            LOGE("[udp] parse header: domain length byte missing");
++            return 0;
++        }
++        uint8_t name_len = *(const uint8_t *)(buf + offset);
++        /* total needed: 1 (atyp) + 1 (name_len) + name_len + 2 (port) */
++        if (!REMAIN_AT_LEAST(1 + name_len + 2)) {
++            LOGE("[udp] parse header: domain header too short (name_len=%d, buf_len=%zu)", name_len, buf_len);
++            return 0;
++        }
++        /* guard tmp buffer size */
++        if (name_len >= MAX_HOSTNAME_LEN) {
++            LOGE("[udp] parse header: domain name too long (%d >= %d)", name_len, MAX_HOSTNAME_LEN);
++            return 0;
++        }
++
++        if (storage != NULL) {
++            char tmp[MAX_HOSTNAME_LEN];
++            memset(tmp, 0, sizeof(tmp));
++            memcpy(tmp, buf + offset + 1, name_len);
++            tmp[name_len] = '\0'; /* ensure nul-terminated */
++
++            struct cork_ip ip;
++            if (cork_ip_init(&ip, tmp) != -1) {
++                if (ip.version == 4) {
++                    struct sockaddr_in *addr = (struct sockaddr_in *)storage;
++                    memset(addr, 0, sizeof(*addr));
++                    addr->sin_family = AF_INET;
++                    if (inet_pton(AF_INET, tmp, &(addr->sin_addr)) <= 0) {
++                        LOGE("[udp] inet_pton failed for %s", tmp);
++                    }
++                    memcpy(&addr->sin_port, buf + offset + 1 + name_len, sizeof(uint16_t));
++                } else if (ip.version == 6) {
++                    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)storage;
++                    memset(addr6, 0, sizeof(*addr6));
++                    addr6->sin6_family = AF_INET6;
++                    if (inet_pton(AF_INET6, tmp, &(addr6->sin6_addr)) <= 0) {
++                        LOGE("[udp] inet_pton failed for %s", tmp);
++                    }
++                    memcpy(&addr6->sin6_port, buf + offset + 1 + name_len, sizeof(uint16_t));
++                } else {
++                    /* leave storage with AF_UNSPEC so caller can know it failed */
++                    ((struct sockaddr_storage*)storage)->ss_family = AF_UNSPEC;
++                }
++            } else {
++                /* try resolving later — for now leave storage untouched or AF_UNSPEC */
++                ((struct sockaddr_storage*)storage)->ss_family = AF_UNSPEC;
++            }
++        }
++        if (host != NULL) {
++            /* copy and NUL-terminate host */
++            memcpy(host, buf + offset + 1, name_len);
++            host[name_len] = '\0';
++        }
++        offset += 1 + name_len + 2;
++    } else if ((atyp & ADDRTYPE_MASK) == 4) {
++        /* IPv6 */
++        size_t in6_addr_len = sizeof(struct in6_addr);
++        /* need: 1 (atyp) + in6_addr_len + 2 (port) */
++        if (!REMAIN_AT_LEAST(in6_addr_len + 2)) {
++            LOGE("[udp] parse header: IPv6 header too short");
++            return 0;
++        }
++        if (storage != NULL) {
++            struct sockaddr_in6 *addr = (struct sockaddr_in6 *)storage;
++            addr->sin6_family = AF_INET6;
++            memcpy(&addr->sin6_addr, buf + offset, in6_addr_len);
++            memcpy(&addr->sin6_port, buf + offset + in6_addr_len, sizeof(uint16_t));
++        }
++        if (host != NULL) {
++            if (inet_ntop(AF_INET6, (const void *)(buf + offset), host, INET6_ADDRSTRLEN) == NULL) {
++                host[0] = '\0';
++            }
++        }
++        offset += in6_addr_len + 2;
++    } else {
++        LOGE("[udp] parse header: unknown atyp %d", atyp);
++        return 0;
++    }
++
++    /* final sanity */
++    if (offset <= 1 || (size_t)offset > buf_len) {
++        LOGE("[udp] invalid header parsing result (offset=%d, buf_len=%zu)", offset, buf_len);
++        return 0;
++    }
++
++    /* fill port if requested (offset currently points just past port) */
++    if (port != NULL) {
++        /* port bytes are at offset-2 .. offset-1 */
++        int port_val = load16_be((const uint8_t *)buf + offset - 2);
++        sprintf(port, "%d", port_val);
++    }
++
++    return offset;
++}
++
+ ssize_t
+ get_sockaddr(char *host, char *port,
+              struct sockaddr_storage *storage, int block,
+diff --git a/src/netutils.h b/src/netutils.h
+index 47320a0..9dc404d 100644
+--- a/src/netutils.h
++++ b/src/netutils.h
+@@ -88,6 +88,10 @@ ssize_t get_sockaddr(char *host, char *port,
+                      struct sockaddr_storage *storage, int block,
+                      int ipv6first);
+ int set_reuseport(int socket);
++int construct_udprelay_header(const struct sockaddr_storage *in_addr,
++                              char *addr_header);
++int parse_udprelay_header(const char *buf, const size_t buf_len,
++                          char *host, char *port, struct sockaddr_storage *storage);
+ 
+ #ifdef SET_INTERFACE
+ int setinterface(int socket_fd, const char *interface_name);
+diff --git a/src/probe.c b/src/probe.c
+new file mode 100644
+index 0000000..f6aae38
+--- /dev/null
++++ b/src/probe.c
+@@ -0,0 +1,311 @@
++/*
++ * probe.c - Active probing for remote server status
++ *
++ * Copyright (C) 2019, zkc <zkc@tcpip.fun>
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++
++#include <libcork/core.h>
++
++#include "probe.h"
++#include "utils.h"
++#include "netutils.h"
++#include "udprelay.h"
++
++#define MAX_LISTENERS 32
++
++/* UDP Probe */
++typedef struct udp_probe_ctx {
++    ev_io io;
++    ev_timer watcher;
++    int remote_idx;
++    server_ctx_t *server_ctx;
++    crypto_t *crypto;
++} udp_probe_ctx_t;
++
++static ev_timer udp_probe_timer;
++static server_ctx_t *udp_servers[MAX_LISTENERS] = { NULL };
++static int probe_timeout_secs = 5;
++static int probe_up_threshold = 1;
++static int probe_down_threshold = 3;
++static int udp_server_count = 0;
++
++static int *udp_probe_success_count = NULL;
++static int *udp_probe_failure_count = NULL;
++
++static unsigned char *dns_probe_packet = NULL;
++static size_t dns_probe_packet_len = 0;
++
++/*
++ * build_dns_query - Constructs a DNS query packet for a given domain name.
++ * Returns the length of the generated packet, or 0 on failure.
++ */
++static size_t build_dns_query(const char *domain, unsigned char *buf, size_t buf_len) {
++    if (!domain || !buf) return 0;
++
++    // DNS Header (12 bytes)
++    // ID (random), QR=0, Opcode=0, AA=0, TC=0, RD=1, RA=0, Z=0, RCODE=0
++    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
++    unsigned char header[] = {
++        rand() % 256, rand() % 256, // Transaction ID
++        0x01, 0x00, // Flags: 0x0100 (Standard query)
++        0x00, 0x01, // Questions: 1
++        0x00, 0x00, // Answer RRs: 0
++        0x00, 0x00, // Authority RRs: 0
++        0x00, 0x00  // Additional RRs: 0
++    };
++    size_t offset = sizeof(header);
++    if (buf_len < offset) return 0;
++    memcpy(buf, header, offset);
++
++    // QNAME section
++    const char *p = domain;
++    while (*p) {
++        const char *dot = strchr(p, '.');
++        size_t len = dot ? (dot - p) : strlen(p);
++        if (buf_len < offset + 1 + len) return 0;
++        buf[offset++] = (unsigned char)len;
++        memcpy(buf + offset, p, len);
++        offset += len;
++        p += len;
++        if (dot) p++; // Skip the dot
++    }
++    if (buf_len < offset + 5) return 0; // 1 (null terminator) + 2 (QTYPE) + 2 (QCLASS)
++    buf[offset++] = 0x00; // Null terminator for QNAME
++    buf[offset++] = 0x00; buf[offset++] = 0x01; // QTYPE: A
++    buf[offset++] = 0x00; buf[offset++] = 0x01; // QCLASS: IN
++    return offset;
++}
++
++/* UDP Probe Implementation */
++static void udp_probe_cleanup(EV_P_ udp_probe_ctx_t *p_ctx) {
++    ev_io_stop(EV_A_ &p_ctx->io);
++    ev_timer_stop(EV_A_ &p_ctx->watcher);
++    close(p_ctx->io.fd);
++    ss_free(p_ctx);
++}
++
++static void udp_probe_recv_cb(EV_P_ ev_io *w, int revents) {
++    udp_probe_ctx_t *p_ctx = (udp_probe_ctx_t *)w;
++    buffer_t *buf = ss_malloc(sizeof(buffer_t));
++    balloc(buf, MAX_UDP_PACKET_SIZE);
++
++    ssize_t r = recv(p_ctx->io.fd, buf->data, MAX_UDP_PACKET_SIZE, 0);
++    bool success = false;
++    if (r > 0) {
++        buf->len = r;
++        if (p_ctx->crypto->decrypt_all(buf, p_ctx->crypto->cipher, buf->capacity) == 0) {
++            // The decrypted payload is: [ss addr header][dns response]
++            // We need to parse the ss addr header first to get to the dns response.
++            int header_len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, NULL);
++
++            if (header_len > 0 && buf->len > header_len) {
++                const char *dns_response_ptr = buf->data + header_len;
++                const size_t dns_response_len = buf->len - header_len;
++
++                /*
++                 * A successful probe requires:
++                 * 1. DNS RCODE is 0 (No Error).
++                 * 2. ANCOUNT (Answer Record Count) is greater than 0.
++                 */
++                const bool rcode_ok = (dns_response_len >= 12) && ((dns_response_ptr[3] & 0x0F) == 0);
++                const bool has_answers = rcode_ok && (load16_be((const uint8_t *)dns_response_ptr + 6) > 0);
++
++                if (rcode_ok && has_answers) {
++                    success = true;
++                }
++            }
++        }
++    }
++
++    if (success) {
++        udp_probe_failure_count[p_ctx->remote_idx] = 0;
++        udp_probe_success_count[p_ctx->remote_idx]++;
++
++        if (!p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
++            udp_probe_success_count[p_ctx->remote_idx] >= probe_up_threshold) {
++            LOGI("[udp-probe] remote %d is back online after %d successful probes.", p_ctx->remote_idx, udp_probe_success_count[p_ctx->remote_idx]);
++            p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = true;
++        }
++    } else {
++        /* If already up, we don't need to log anything, just update latency */
++        if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx]) {
++        }
++    } else {
++        udp_probe_success_count[p_ctx->remote_idx] = 0;
++        udp_probe_failure_count[p_ctx->remote_idx]++;
++
++        if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
++            udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
++            LOGI("[udp-probe] remote %d is offline after %d failed probes.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
++            p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++        }
++    }
++
++    bfree(buf);
++    ss_free(buf);
++    udp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void udp_probe_timeout_cb(EV_P_ ev_timer *w, int revents) {
++    udp_probe_ctx_t *p_ctx = cork_container_of(w, udp_probe_ctx_t, watcher);
++
++    udp_probe_success_count[p_ctx->remote_idx] = 0;
++    udp_probe_failure_count[p_ctx->remote_idx]++;
++
++    const char *addr_str = get_addr_str(p_ctx->server_ctx->remote_addr[p_ctx->remote_idx], true);
++    if (p_ctx->server_ctx->remote_status[p_ctx->remote_idx] &&
++        udp_probe_failure_count[p_ctx->remote_idx] >= probe_down_threshold) {
++        LOGI("[udp-probe] remote %d is offline after %d probe timeouts.", p_ctx->remote_idx, udp_probe_failure_count[p_ctx->remote_idx]);
++        p_ctx->server_ctx->remote_status[p_ctx->remote_idx] = false;
++    }
++
++    udp_probe_cleanup(EV_A_ p_ctx);
++}
++
++static void start_one_udp_probe(EV_P_ server_ctx_t *s_ctx, int idx) {
++    struct sockaddr *remote_addr = s_ctx->remote_addr[idx];
++    int probefd = socket(remote_addr->sa_family, SOCK_DGRAM, 0);
++    if (probefd == -1) return;
++
++    setnonblocking(probefd);
++
++    if (!dns_probe_packet) {
++        close(probefd);
++        return;
++    }
++
++    /* This logic now mirrors server_recv_cb to ensure packet format is identical
++     * to a real proxied packet. */
++
++    struct sockaddr_storage dns_server_addr;
++    if (get_sockaddr("8.8.8.8", "53", &dns_server_addr, 1, 0) != 0) {
++        LOGE("[udp-probe] failed to resolve 8.8.8.8:53");
++        close(probefd);
++        return;
++    }
++    char addr_header[MAX_ADDR_HEADER_SIZE] = {0};
++    int addr_header_len = construct_udprelay_header(&dns_server_addr, addr_header);
++
++    buffer_t *buf = ss_malloc(sizeof(buffer_t));
++    balloc(buf, MAX_UDP_PACKET_SIZE);
++
++    /* 1. Start with the raw DNS query as the initial payload */
++    memcpy(buf->data, dns_probe_packet, dns_probe_packet_len);
++    buf->len = dns_probe_packet_len;
++
++    /* 2. Prepend the shadowsocks address header */
++    brealloc(buf, buf->len + addr_header_len, MAX_UDP_PACKET_SIZE);
++    memmove(buf->data + addr_header_len, buf->data, buf->len);
++    memcpy(buf->data, addr_header, addr_header_len);
++    buf->len += addr_header_len;
++
++    /* 3. Encrypt the entire payload ([addr_header][dns_packet]) */
++    if (s_ctx->crypto->encrypt_all(buf, s_ctx->crypto->cipher, buf->capacity) != 0) {
++        bfree(buf);
++        ss_free(buf);
++        close(probefd);
++        return;
++    }
++
++    sendto(probefd, buf->data, buf->len, 0, remote_addr, get_sockaddr_len(remote_addr));
++    bfree(buf);
++    ss_free(buf);
++
++    udp_probe_ctx_t *p_ctx = ss_malloc(sizeof(udp_probe_ctx_t));
++    memset(p_ctx, 0, sizeof(udp_probe_ctx_t));
++    p_ctx->server_ctx = s_ctx;
++    p_ctx->remote_idx = idx;
++    p_ctx->crypto = s_ctx->crypto;
++
++    ev_io_init(&p_ctx->io, udp_probe_recv_cb, probefd, EV_READ);
++    ev_timer_init(&p_ctx->watcher, udp_probe_timeout_cb, probe_timeout_secs, 0);
++    ev_io_start(EV_A_ &p_ctx->io);
++    ev_timer_start(EV_A_ &p_ctx->watcher);
++}
++
++static void udp_probe_timer_cb(EV_P_ ev_timer *w, int revents) {
++    for (int i = 0; i < udp_server_count; i++) {
++        server_ctx_t *s_ctx = udp_servers[i];
++        if (s_ctx && s_ctx->remote_num > 1) {
++            for (int j = 0; j < s_ctx->remote_num; j++) {
++                start_one_udp_probe(EV_A_ s_ctx, j);
++            }
++        }
++    }
++}
++
++/* Public Interface */
++void probe_init(EV_P_ int udp_interval, int udp_timeout, int up_count, int down_count, const char *probe_domain) {
++    /*
++     * Initialize the timer to fire immediately (after=0) upon starting the event loop,
++     * and then repeat at the specified interval.
++     */
++    ev_timer_init(&udp_probe_timer, udp_probe_timer_cb, 0, udp_interval);
++    probe_timeout_secs = udp_timeout;
++
++    if (up_count > 0) probe_up_threshold = up_count;
++    if (down_count > 0) probe_down_threshold = down_count;
++
++    /* Allocate counters for all possible remotes */
++    udp_probe_success_count = ss_malloc(sizeof(int) * MAX_REMOTE_NUM);
++    udp_probe_failure_count = ss_malloc(sizeof(int) * MAX_REMOTE_NUM);
++    memset(udp_probe_success_count, 0, sizeof(int) * MAX_REMOTE_NUM);
++    memset(udp_probe_failure_count, 0, sizeof(int) * MAX_REMOTE_NUM);
++
++    /* Build the DNS probe packet */
++    dns_probe_packet = ss_malloc(512);
++    dns_probe_packet_len = build_dns_query(probe_domain, dns_probe_packet, 512);
++    if (dns_probe_packet_len == 0) {
++        LOGE("[probe] failed to build DNS query packet for domain: %s", probe_domain);
++        ss_free(dns_probe_packet);
++        dns_probe_packet = NULL;
++    }
++    LOGI("[probe] initialized with domain=%s, interval=%d, timeout=%d, up_threshold=%d, down_threshold=%d", 
++        probe_domain, udp_interval, udp_timeout, probe_up_threshold, probe_down_threshold);
++}
++
++void probe_add_udp_server(void *server_ptr) {
++    server_ctx_t *server = (server_ctx_t *)server_ptr;
++    if (udp_server_count < MAX_LISTENERS) {
++        udp_servers[udp_server_count++] = server;
++        if (server->remote_num > 1 && !ev_is_active(&udp_probe_timer)) {
++            ev_timer_start(EV_DEFAULT, &udp_probe_timer);
++        }
++    } else {
++        LOGE("[probe] too many udp servers");
++    }
++}
++
++void probe_cleanup(EV_P) {
++    if (ev_is_active(&udp_probe_timer)) {
++        ev_timer_stop(EV_A_ &udp_probe_timer);
++    }
++    ss_free(udp_probe_success_count);
++    ss_free(udp_probe_failure_count);
++    udp_probe_success_count = NULL;
++    udp_probe_failure_count = NULL;
++    ss_free(dns_probe_packet);
++    dns_probe_packet = NULL;
++}
+\ No newline at end of file
+diff --git a/src/probe.h b/src/probe.h
+new file mode 100644
+index 0000000..4e6f5ee
+--- /dev/null
++++ b/src/probe.h
+@@ -0,0 +1,32 @@
++/*
++ * probe.h - Active probing for remote server status
++ *
++ * Copyright (C) 2019, zkc <zkc@tcpip.fun>
++ *
++ * This file is part of the shadowsocks-libev.
++ *
++ * shadowsocks-libev is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * shadowsocks-libev is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with shadowsocks-libev; see the file COPYING. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _PROBE_H
++#define _PROBE_H
++
++#include <ev.h>
++
++void probe_init(EV_P_ int udp_interval, int udp_timeout, int up_count, int down_count, const char *domain);
++void probe_add_udp_server(void *server);
++void probe_cleanup(EV_P);
++
++#endif // _PROBE_H
+\ No newline at end of file
+diff --git a/src/redir.c b/src/redir.c
+index 069ac22..a218eaf 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -52,6 +52,7 @@
+ #include "utils.h"
+ #include "common.h"
+ #include "redir.h"
++#include "probe.h"
+ 
+ #ifndef EAGAIN
+ #define EAGAIN EWOULDBLOCK
+@@ -87,6 +88,9 @@ static void close_and_free_remote(EV_P_ remote_t *remote);
+ static void free_server(server_t *server);
+ static void close_and_free_server(EV_P_ server_t *server);
+ 
++static void start_connect_remote(EV_P_ server_t *server);
++static void failover_to_next_remote(EV_P_ server_t *server);
++
+ int verbose    = 0;
+ int reuse_port = 0;
+ int tcp_incoming_sndbuf = 0;
+@@ -112,6 +116,10 @@ static struct ev_signal sigchld_watcher;
+ 
+ static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
+ 
++#define MAX_LISTEN_CTX 128
++static listen_ctx_t *listen_ctx_list[MAX_LISTEN_CTX] = { NULL };
++static int listen_ctx_count                          = 0;
++
+ static int
+ getdestaddr(int fd, struct sockaddr_storage *destaddr)
+ {
+@@ -133,16 +141,6 @@ getdestaddr(int fd, struct sockaddr_storage *destaddr)
+     return 0;
+ }
+ 
+-int
+-setnonblocking(int fd)
+-{
+-    int flags;
+-    if (-1 == (flags = fcntl(fd, F_GETFL, 0))) {
+-        flags = 0;
+-    }
+-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+-}
+-
+ int
+ create_and_bind(const char *addr, const char *port)
+ {
+@@ -223,7 +221,7 @@ static void
+ server_recv_cb(EV_P_ ev_io *w, int revents)
+ {
+     server_ctx_t *server_recv_ctx = (server_ctx_t *)w;
+-    server_t *server              = server_recv_ctx->server;
++    server_t *server             = server_recv_ctx->server;
+     remote_t *remote              = server->remote;
+ 
+     ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
+@@ -315,7 +313,7 @@ static void
+ server_send_cb(EV_P_ ev_io *w, int revents)
+ {
+     server_ctx_t *server_send_ctx = (server_ctx_t *)w;
+-    server_t *server              = server_send_ctx->server;
++    server_t *server             = server_send_ctx->server;
+     remote_t *remote              = server->remote;
+     if (server->buf->len == 0) {
+         // close and free
+@@ -383,15 +381,19 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+ 
+     ev_timer_stop(EV_A_ watcher);
+ 
+-    close_and_free_remote(EV_A_ remote);
+-    close_and_free_server(EV_A_ server);
++    /* On remote connect/send timeout, try failover (don't immediately
++     * kill the server). The failover function will close the current
++     * remote socket and start connect to next remote in the listener
++     * address list.
++     */
++    failover_to_next_remote(EV_A_ server);
+ }
+ 
+ static void
+ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ {
+     remote_ctx_t *remote_recv_ctx = (remote_ctx_t *)w;
+-    remote_t *remote              = remote_recv_ctx->remote;
++    remote_t *remote                    = remote_recv_ctx->remote;
+     server_t *server              = remote->server;
+ 
+     ssize_t r = recv(remote->fd, server->buf->data, SOCKET_BUF_SIZE, 0);
+@@ -460,8 +462,8 @@ static void
+ remote_send_cb(EV_P_ ev_io *w, int revents)
+ {
+     remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
+-    remote_t *remote              = remote_send_ctx->remote;
+-    server_t *server              = remote->server;
++    remote_t *remote                    = remote_send_ctx->remote;
++    server_t *server                    = remote->server;
+ 
+     ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
+ 
+@@ -480,7 +482,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+             ev_io_stop(EV_A_ & server->recv_ctx->io);
+             ev_io_start(EV_A_ & remote->recv_ctx->io);
+ 
+-            // send destaddr
++            /* send destaddr */
+             buffer_t ss_addr_to_send;
+             buffer_t *abuf = &ss_addr_to_send;
+             balloc(abuf, SOCKET_BUF_SIZE);
+@@ -532,8 +534,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         } else {
+             ERROR("getpeername");
+             // not connected
+-            close_and_free_remote(EV_A_ remote);
+-            close_and_free_server(EV_A_ server);
++            failover_to_next_remote(EV_A_ server);
+             return;
+         }
+     }
+@@ -578,8 +579,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+                     } else {
+                         ERROR("fast_open_connect");
+                     }
+-                    close_and_free_remote(EV_A_ remote);
+-                    close_and_free_server(EV_A_ server);
++                    failover_to_next_remote(EV_A_ server);
+                 }
+                 return;
+             }
+@@ -591,19 +591,18 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
+         if (s == -1) {
+             if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                 ERROR("send");
+-                // close and free
+-                close_and_free_remote(EV_A_ remote);
+-                close_and_free_server(EV_A_ server);
++                /* close current remote and try next */
++                failover_to_next_remote(EV_A_ server);
+             }
+             return;
+         } else if (s < remote->buf->len) {
+-            // partly sent, move memory, wait for the next time to send
++            /* partly sent, move memory, wait for the next time to send */
+             remote->buf->len -= s;
+             remote->buf->idx += s;
+             ev_io_start(EV_A_ & remote_send_ctx->io);
+             return;
+         } else {
+-            // all sent out, wait for reading
++            /* all sent out, wait for reading */
+             remote->buf->len = 0;
+             remote->buf->idx = 0;
+             ev_io_stop(EV_A_ & remote_send_ctx->io);
+@@ -733,43 +732,61 @@ close_and_free_server(EV_P_ server_t *server)
+ }
+ 
+ static void
+-accept_cb(EV_P_ ev_io *w, int revents)
++failover_to_next_remote(EV_P_ server_t *server)
+ {
+-    listen_ctx_t *listener = (listen_ctx_t *)w;
+-    struct sockaddr_storage destaddr;
+-    memset(&destaddr, 0, sizeof(struct sockaddr_storage));
+-
+-    int err;
++    if (server->remote) {
++        close_and_free_remote(EV_A_ server->remote);
++        server->remote = NULL;
++    }
+ 
+-    int serverfd = accept(listener->fd, NULL, NULL);
+-    if (serverfd == -1) {
+-        ERROR("accept");
+-        return;
++    /* Mark current remote as down */
++    if (server->listener) {
++        server->listener->remote_status[server->remote_idx] = false;
++        LOGI("failover: marked remote %d as offline.", server->remote_idx);
+     }
+ 
+-    err = getdestaddr(serverfd, &destaddr);
+-    if (err) {
+-        ERROR("getdestaddr");
++    /*
++     * Reset cipher context before trying the next remote.
++     * Each new connection attempt to a remote must start with a fresh cipher context,
++     * especially for AEAD ciphers, to send a new salt/IV.
++     */
++    crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
++    crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
++
++    /* find next available remote index for this server + listener */
++    int next_idx = -1;
++    if (server->listener && server->listener->remote_num > 0) {
++        for (int i = 1; i < server->listener->remote_num; i++) {
++            int check_idx = (server->remote_idx + i) % server->listener->remote_num;
++            if (server->listener->remote_status[check_idx]) {
++                next_idx = check_idx;
++                break;
++            }
++        }
++    }
++    if (next_idx == -1) {
++        LOGE("failover: no other remote servers available.");
++        close_and_free_server(EV_A_ server);
+         return;
+     }
++    server->remote_idx = next_idx;
++    LOGI("failover: server %p now trying remote_idx %d", (void *)server, server->remote_idx);
+ 
+-    setnonblocking(serverfd);
+-    int opt = 1;
+-    setsockopt(serverfd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+-#ifdef SO_NOSIGPIPE
+-    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+-#endif
++    start_connect_remote(EV_A_ server);
++}
+ 
+-    if (tcp_incoming_sndbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+-    }
++static void
++start_connect_remote(EV_P_ server_t *server)
++{
++    listen_ctx_t *listener = server->listener;
+ 
+-    if (tcp_incoming_rcvbuf > 0) {
+-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
++    if (server->remote_idx >= listener->remote_num) {
++        LOGE("all remote servers failed to connect");
++        close_and_free_server(EV_A_ server);
++        return;
+     }
+ 
+-    int index                    = rand() % listener->remote_num;
+-    struct sockaddr *remote_addr = listener->remote_addr[index];
++    struct sockaddr *remote_addr = listener->remote_addr[server->remote_idx];
+ 
+     int protocol = IPPROTO_TCP;
+     if (listener->mptcp < 0) {
+@@ -777,17 +794,19 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     }
+     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
+     if (remotefd == -1) {
+-        ERROR("socket");
++        ERROR("[tcp] socket");
++        failover_to_next_remote(EV_A_ server);
+         return;
+     }
+ 
+-    // Set flags
++    int opt = 1;
++    /* Set flags */
+     setsockopt(remotefd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+ #ifdef SO_NOSIGPIPE
+     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+ #endif
+ 
+-    // Enable TCP keepalive feature
++    /* Enable TCP keepalive feature */
+     int keepAlive    = 1;
+     int keepIdle     = 40;
+     int keepInterval = 20;
+@@ -797,7 +816,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     setsockopt(remotefd, SOL_TCP, TCP_KEEPINTVL, (void *)&keepInterval, sizeof(keepInterval));
+     setsockopt(remotefd, SOL_TCP, TCP_KEEPCNT, (void *)&keepCount, sizeof(keepCount));
+ 
+-    // Set non blocking
++    /* Set non blocking */
+     setnonblocking(remotefd);
+ 
+     if (listener->tos >= 0) {
+@@ -817,7 +836,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+         if (err == -1) {
+-            ERROR("failed to enable out-of-tree multipath TCP");
++            ERROR("[tcp] failed to enable out-of-tree multipath TCP");
+         }
+     } else if (listener->mptcp == 1) {
+         int i = 0;
+@@ -829,7 +848,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+             i++;
+         }
+         if (listener->mptcp == 0) {
+-            ERROR("failed to enable out-of-tree multipath TCP");
++            ERROR("[tcp] failed to enable out-of-tree multipath TCP");
+         }
+     }
+ 
+@@ -849,32 +868,89 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     }
+ #endif
+ 
+-    server_t *server = new_server(serverfd);
+     remote_t *remote = new_remote(remotefd, listener->timeout);
+     server->remote   = remote;
+     remote->server   = server;
+-    server->destaddr = destaddr;
+ 
+     if (fast_open) {
+-        // save remote addr for fast open
++        /* save remote addr for fast open */
+         remote->addr = remote_addr;
+         ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+     } else {
+         int r = connect(remotefd, remote_addr, get_sockaddr_len(remote_addr));
+ 
+         if (r == -1 && errno != CONNECT_IN_PROGRESS) {
+-            ERROR("connect");
+-            close_and_free_remote(EV_A_ remote);
+-            close_and_free_server(EV_A_ server);
++            ERROR("[tcp] connect");
++            failover_to_next_remote(EV_A_ server);
+             return;
+         }
+-        // listen to remote connected event
++        /* listen to remote connected event */
+         ev_io_start(EV_A_ & remote->send_ctx->io);
+         ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+     }
+     ev_io_start(EV_A_ & server->recv_ctx->io);
+ }
+ 
++static void
++accept_cb(EV_P_ ev_io *w, int revents)
++{
++    listen_ctx_t *listener = (listen_ctx_t *)w;
++    struct sockaddr_storage destaddr;
++    memset(&destaddr, 0, sizeof(struct sockaddr_storage));
++
++    int err;
++
++    int serverfd = accept(listener->fd, NULL, NULL);
++    if (serverfd == -1) {
++        ERROR("[tcp] accept");
++        return;
++    }
++
++    err = getdestaddr(serverfd, &destaddr);
++    if (err) {
++        ERROR("[tcp] getdestaddr");
++        return;
++    }
++
++    setnonblocking(serverfd);
++    int opt = 1;
++    setsockopt(serverfd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
++#ifdef SO_NOSIGPIPE
++    setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
++#endif
++
++    if (tcp_incoming_sndbuf > 0) {
++        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
++    }
++
++    if (tcp_incoming_rcvbuf > 0) {
++        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
++    }
++
++    server_t *server = new_server(serverfd);
++    server->destaddr = destaddr;
++
++    /* associate with listener and find first available remote */
++    server->listener = listener;
++    int start_idx = -1;
++    if (listener && listener->remote_num > 0) {
++        for (int i = 0; i < listener->remote_num; i++) {
++            if (listener->remote_status[i]) {
++                start_idx = i;
++                break;
++            }
++        }
++    }
++    if (start_idx == -1) {
++        LOGE("No remote servers available, dropping connection.");
++        close(serverfd);
++        free_server(server);
++        return;
++    }
++    server->remote_idx = start_idx;
++    start_connect_remote(EV_A_ server);
++}
++
+ static void
+ signal_cb(EV_P_ ev_signal *w, int revents)
+ {
+@@ -887,13 +963,15 @@ signal_cb(EV_P_ ev_signal *w, int revents)
+             } else
+                 return;
+         case SIGINT:
+-        case SIGTERM:
++        case SIGTERM: {
+             ev_signal_stop(EV_DEFAULT, &sigint_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+             ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
++            probe_cleanup(EV_A);
+ 
+             ev_unloop(EV_A_ EVUNLOOP_ALL);
+         }
++        }
+     }
+ }
+ 
+@@ -920,6 +998,11 @@ main(int argc, char **argv)
+     char *plugin_opts = NULL;
+     char *plugin_host = NULL;
+     char *plugin_port = NULL;
++    int probe_interval = 0;
++    int probe_timeout = 0;
++    int probe_up_count = 0;
++    int probe_down_count = 0;
++    char *probe_domain = NULL;
+     char tmp_port[8];
+ 
+     int dscp_num    = 0;
+@@ -946,6 +1029,11 @@ main(int argc, char **argv)
+         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
+         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
+         { "fwmark",      required_argument, NULL, GETOPT_VAL_FWMARK      },
++        { "probe-interval", required_argument, NULL, GETOPT_VAL_PROBE_INTERVAL },
++        { "probe-timeout",  required_argument, NULL, GETOPT_VAL_PROBE_TIMEOUT  },
++        { "probe-up-count", required_argument, NULL, GETOPT_VAL_PROBE_UP_COUNT },
++        { "probe-down-count", required_argument, NULL, GETOPT_VAL_PROBE_DOWN_COUNT },
++        { "probe-domain", required_argument, NULL, GETOPT_VAL_PROBE_DOMAIN },
+         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
+         { NULL,          0,                 NULL, 0                      }
+     };
+@@ -984,7 +1072,22 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_FWMARK:
+             fwmark = atoi(optarg);
+-            LOGE("fwmark is only available on Linux");
++            LOGI("fwmark set to %d", fwmark);
++            break;
++        case GETOPT_VAL_PROBE_INTERVAL:
++            probe_interval = atoi(optarg);
++            break;
++        case GETOPT_VAL_PROBE_TIMEOUT:
++            probe_timeout = atoi(optarg);
++            break;
++        case GETOPT_VAL_PROBE_UP_COUNT:
++            probe_up_count = atoi(optarg);
++            break;
++        case GETOPT_VAL_PROBE_DOWN_COUNT:
++            probe_down_count = atoi(optarg);
++            break;
++        case GETOPT_VAL_PROBE_DOMAIN:
++            probe_domain = optarg;
+             break;
+         case GETOPT_VAL_REUSE_PORT:
+             reuse_port = 1;
+@@ -1165,6 +1268,21 @@ main(int argc, char **argv)
+             fwmark = conf->fwmark;
+             LOGI("set firewall mark to %d", fwmark);
+         }
++        if (probe_interval == 0) {
++            probe_interval = conf->probe_interval;
++        }
++        if (probe_timeout == 0) {
++            probe_timeout = conf->probe_timeout;
++        }
++        if (probe_up_count == 0) {
++            probe_up_count = conf->probe_up_count;
++        }
++        if (probe_down_count == 0) {
++            probe_down_count = conf->probe_down_count;
++        }
++        if (probe_domain == NULL) {
++            probe_domain = conf->probe_domain;
++        }
+     }
+ 
+     if (remote_num == 0 || remote_port == NULL || local_port == NULL
+@@ -1289,7 +1407,23 @@ main(int argc, char **argv)
+         }
+     }
+ 
+-    // ignore SIGPIPE
++    if (probe_interval <= 0) {
++        probe_interval = 60; /* default 60s */
++    }
++    if (probe_timeout <= 0){
++        probe_timeout = 5; /* default 5s */
++    }
++    if (probe_up_count <= 0) {
++        probe_up_count = 3; /* default 3 */
++    }
++    if (probe_down_count <= 0){
++        probe_down_count = 3; /* default 3 */
++    }
++    if(!probe_domain || strlen(probe_domain) == 0) {
++        probe_domain = "www.google.com";
++    }
++
++    /* ignore SIGPIPE */
+     signal(SIGPIPE, SIG_IGN);
+     signal(SIGABRT, SIG_IGN);
+ 
+@@ -1300,19 +1434,25 @@ main(int argc, char **argv)
+     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
+ 
+-    // Setup keys
++    struct ev_loop *loop = EV_DEFAULT;
++
++    probe_init(EV_A_ probe_interval, probe_timeout, probe_up_count, probe_down_count, probe_domain);
++
+     LOGI("initializing ciphers... %s", method);
+     crypto = crypto_init(password, key, method);
+     if (crypto == NULL)
+         FATAL("failed to initialize ciphers");
+ 
+-    // Setup proxy context
++    /* Setup proxy context */
+     struct listen_ctx listen_ctx;
+     memset(&listen_ctx, 0, sizeof(struct listen_ctx));
+     listen_ctx.remote_num  = remote_num;
+     listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
+     memset(listen_ctx.remote_addr, 0, sizeof(struct sockaddr *) * remote_num);
++    listen_ctx.remote_status = ss_malloc(sizeof(bool) * remote_num);
++
+     for (i = 0; i < remote_num; i++) {
++        listen_ctx.remote_status[i] = true; /* Assume all are up initially */
+         char *host = remote_addr[i].host;
+         char *port = remote_addr[i].port == NULL ? remote_port :
+                      remote_addr[i].port;
+@@ -1333,63 +1473,59 @@ main(int argc, char **argv)
+     listen_ctx.timeout = atoi(timeout);
+     listen_ctx.mptcp   = mptcp;
+ 
+-    struct ev_loop *loop = EV_DEFAULT;
+-
+-    listen_ctx_t *listen_ctx_current = &listen_ctx;
+-    do {
+-        if (listen_ctx_current->tos) {
+-            LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
+-        } else {
+-            LOGI("listening at %s:%s", local_addr, local_port);
+-        }
++    /*
++     * Initialize UDP relay first if enabled.
++     * This is crucial because the UDP module allocates and manages the
++     * `remote_status` array that the TCP module will share.
++     */
++    if (mode != TCP_ONLY) {
++        init_udprelay(local_addr, local_port, listen_ctx.remote_num,
++                      listen_ctx.remote_addr, mtu, crypto,
++                      listen_ctx.timeout, NULL, fwmark, listen_ctx.remote_status);
++    }
+ 
+-        if (mode != UDP_ONLY) {
+-            // Setup socket
+-            int listenfd;
+-            listenfd = create_and_bind(local_addr, local_port);
+-            if (listenfd == -1) {
+-                FATAL("bind() error");
+-            }
+-            if (listen(listenfd, SOMAXCONN) == -1) {
+-                FATAL("listen() error");
++    /*
++     * Now, set up TCP listeners. They will all share the same `remote_status`
++     * array, which is either managed by the UDP prober or statically set to true.
++     */
++    if (mode != UDP_ONLY) {
++        listen_ctx_t *listen_ctx_current = &listen_ctx;
++        do {
++            if (listen_ctx_current->tos) {
++                LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
++            } else {
++                LOGI("listening at %s:%s", local_addr, local_port);
+             }
++
++            int listenfd = create_and_bind(local_addr, local_port);
++            if (listenfd == -1) FATAL("bind() error");
++            if (listen(listenfd, SOMAXCONN) == -1) FATAL("listen() error");
+             setnonblocking(listenfd);
+ 
+             listen_ctx_current->fd = listenfd;
+-
+             ev_io_init(&listen_ctx_current->io, accept_cb, listenfd, EV_READ);
+             ev_io_start(loop, &listen_ctx_current->io);
+-        }
+ 
+-        // Setup UDP
+-        if (mode != TCP_ONLY) {
+-            LOGI("UDP relay enabled");
+-            char *host                       = remote_addr[0].host;
+-            char *port                       = remote_addr[0].port == NULL ? remote_port : remote_addr[0].port;
+-            struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
+-            memset(storage, 0, sizeof(struct sockaddr_storage));
+-            if (get_sockaddr(host, port, storage, 1, ipv6first) == -1) {
+-                FATAL("failed to resolve the provided hostname");
++            if (listen_ctx_count < MAX_LISTEN_CTX) {
++                listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
++            } else {
++                LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
+             }
+-            struct sockaddr *addr = (struct sockaddr *)storage;
+-            init_udprelay(local_addr, local_port, addr,
+-                          get_sockaddr_len(addr), mtu, crypto, listen_ctx_current->timeout, NULL, fwmark);
+-        }
+-
+-        if (mode == UDP_ONLY) {
+-            LOGI("TCP relay disabled");
+-        }
+ 
+-        // Handle additionals TOS/DSCP listening ports
+-        if (dscp_num > 0) {
+-            listen_ctx_current      = (listen_ctx_t *)ss_malloc(sizeof(listen_ctx_t));
+-            listen_ctx_current      = memcpy(listen_ctx_current, &listen_ctx, sizeof(listen_ctx_t));
+-            local_port              = dscp[dscp_num - 1].port;
+-            listen_ctx_current->tos = dscp[dscp_num - 1].dscp << 2;
+-        }
+-    } while (dscp_num-- > 0);
++            /* Handle additional TOS/DSCP listening ports */
++            if (dscp_num > 0) {
++                listen_ctx_t *new_lc = (listen_ctx_t *)ss_malloc(sizeof(listen_ctx_t));
++                memcpy(new_lc, &listen_ctx, sizeof(listen_ctx_t));
++                local_port = dscp[dscp_num - 1].port;
++                new_lc->tos = dscp[dscp_num - 1].dscp << 2;
++                listen_ctx_current = new_lc;
++            }
++        } while (dscp_num-- > 0);
++    } else {
++        LOGI("TCP relay disabled");
++    }
+ 
+-    // setuid
++    /* setuid */
+     if (user != NULL && !run_as(user)) {
+         FATAL("failed to switch user");
+     }
+diff --git a/src/redir.h b/src/redir.h
+index 2544d65..3c134b6 100644
+--- a/src/redir.h
++++ b/src/redir.h
+@@ -38,6 +38,7 @@ typedef struct listen_ctx {
+     int fd;
+     int mptcp;
+     int tos;
++    volatile bool *remote_status;
+     struct sockaddr **remote_addr;
+ } listen_ctx_t;
+ 
+@@ -52,14 +53,16 @@ typedef struct server {
+ 
+     buffer_t *buf;
+ 
+-    cipher_ctx_t *e_ctx;
+-    cipher_ctx_t *d_ctx;
+-    struct server_ctx *recv_ctx;
+-    struct server_ctx *send_ctx;
++    cipher_ctx_t *e_ctx; // encryption context
++    cipher_ctx_t *d_ctx; // decryption context
++    server_ctx_t *recv_ctx;
++    server_ctx_t *send_ctx;
+     struct remote *remote;
+ 
+     struct sockaddr_storage destaddr;
+     ev_timer delayed_connect_watcher;
++    int remote_idx;
++    struct listen_ctx *listener;
+ } server_t;
+ 
+ typedef struct remote_ctx {
+@@ -72,8 +75,8 @@ typedef struct remote_ctx {
+ typedef struct remote {
+     int fd;
+     buffer_t *buf;
+-    struct remote_ctx *recv_ctx;
+-    struct remote_ctx *send_ctx;
++    remote_ctx_t *recv_ctx;
++    remote_ctx_t *send_ctx;
+     struct server *server;
+     uint32_t counter;
+     struct sockaddr *addr;
+diff --git a/src/stream.c b/src/stream.c
+index 4a09933..1f4d06a 100644
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -318,7 +318,6 @@ stream_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
+     cipher_ctx_set_nonce(&cipher_ctx, nonce, nonce_len, 1);
+     memcpy(ciphertext->data, nonce, nonce_len);
+ 
+-
+     if (cipher->method >= SALSA20) {
+         crypto_stream_xor_ic((uint8_t *)(ciphertext->data + nonce_len),
+                              (const uint8_t *)plaintext->data, (uint64_t)(plaintext->len),
+diff --git a/src/udprelay.c b/src/udprelay.c
+index b786e13..c3ff3f2 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -52,6 +52,7 @@
+ #include "netutils.h"
+ #include "cache.h"
+ #include "udprelay.h"
++#include "probe.h"
+ #include "winsock.h"
+ #define MAX_UDP_CONN_NUM 256
+ 
+@@ -67,7 +68,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents);
+ static void remote_recv_cb(EV_P_ ev_io *w, int revents);
+ static void remote_timeout_cb(EV_P_ ev_timer *watcher, int revents);
+ 
+-static char *hash_key(const int af, const struct sockaddr_storage *addr);
++static void hash_key_fill(char *out_key, const int af, const struct sockaddr_storage *addr);
+ static void close_and_free_remote(EV_P_ remote_ctx_t *ctx);
+ static remote_ctx_t *new_remote(int fd, server_ctx_t *server_ctx);
+ 
+@@ -81,16 +82,6 @@ static server_ctx_t *server_ctx_list[MAX_REMOTE_NUM] = { NULL };
+ 
+ const char *s_port = NULL;
+ 
+-static int
+-setnonblocking(int fd)
+-{
+-    int flags;
+-    if (-1 == (flags = fcntl(fd, F_GETFL, 0))) {
+-        flags = 0;
+-    }
+-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+-}
+-
+ #ifdef SO_NOSIGPIPE
+ static int
+ set_nosigpipe(int socket_fd)
+@@ -98,7 +89,6 @@ set_nosigpipe(int socket_fd)
+     int opt = 1;
+     return setsockopt(socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+ }
+-
+ #endif
+ 
+ #ifndef IP_TRANSPARENT
+@@ -125,151 +115,16 @@ set_nosigpipe(int socket_fd)
+ #endif
+ #endif
+ 
+-static int
+-get_dstaddr(struct msghdr *msg, struct sockaddr_storage *dstaddr)
+-{
+-    struct cmsghdr *cmsg;
+-
+-    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+-        if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVORIGDSTADDR) {
+-            memcpy(dstaddr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in));
+-            dstaddr->ss_family = AF_INET;
+-            return 0;
+-        } else if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_RECVORIGDSTADDR) {
+-            memcpy(dstaddr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in6));
+-            dstaddr->ss_family = AF_INET6;
+-            return 0;
+-        }
+-    }
+-
+-    return 1;
+-}
+-
+-#define HASH_KEY_LEN sizeof(struct sockaddr_storage) + sizeof(int)
+-static char *
+-hash_key(const int af, const struct sockaddr_storage *addr)
+-{
+-    size_t addr_len = sizeof(struct sockaddr_storage);
+-    static char key[HASH_KEY_LEN];
+-
+-    memset(key, 0, HASH_KEY_LEN);
+-    memcpy(key, &af, sizeof(int));
+-    memcpy(key + sizeof(int), (const uint8_t *)addr, addr_len);
++/* key length should match usage in cache (keep stable) */
++#define HASH_KEY_LEN (sizeof(struct sockaddr_storage) + sizeof(int))
+ 
+-    return key;
+-}
+-
+-static int
+-construct_udprelay_header(const struct sockaddr_storage *in_addr,
+-                          char *addr_header)
+-{
+-    int addr_header_len = 0;
+-
+-    if (in_addr->ss_family == AF_INET) {
+-        struct sockaddr_in *addr = (struct sockaddr_in *)in_addr;
+-        size_t addr_len          = sizeof(struct in_addr);
+-
+-        addr_header[addr_header_len++] = 1;
+-        memcpy(addr_header + addr_header_len, &addr->sin_addr, addr_len);
+-        addr_header_len += addr_len;
+-        memcpy(addr_header + addr_header_len, &addr->sin_port, 2);
+-        addr_header_len += 2;
+-    } else if (in_addr->ss_family == AF_INET6) {
+-        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)in_addr;
+-        size_t addr_len           = sizeof(struct in6_addr);
+-
+-        addr_header[addr_header_len++] = 4;
+-        memcpy(addr_header + addr_header_len, &addr->sin6_addr, addr_len);
+-        addr_header_len += addr_len;
+-        memcpy(addr_header + addr_header_len, &addr->sin6_port, 2);
+-        addr_header_len += 2;
+-    } else {
+-        return 0;
+-    }
+-
+-    return addr_header_len;
+-}
+-
+-static int
+-parse_udprelay_header(const char *buf, const size_t buf_len,
+-                      char *host, char *port, struct sockaddr_storage *storage)
++/* Fill caller-provided buffer with key (no static buffer) */
++static void
++hash_key_fill(char *out_key, const int af, const struct sockaddr_storage *addr)
+ {
+-    const uint8_t atyp = *(uint8_t *)buf;
+-    int offset         = 1;
+-
+-    // get remote addr and port
+-    if ((atyp & ADDRTYPE_MASK) == 1) {
+-        // IP V4
+-        size_t in_addr_len = sizeof(struct in_addr);
+-        if (buf_len >= in_addr_len + 3) {
+-            if (storage != NULL) {
+-                struct sockaddr_in *addr = (struct sockaddr_in *)storage;
+-                addr->sin_family = AF_INET;
+-                memcpy(&addr->sin_addr, buf + offset, sizeof(struct in_addr));
+-                memcpy(&addr->sin_port, buf + offset + in_addr_len, sizeof(uint16_t));
+-            }
+-            if (host != NULL) {
+-                inet_ntop(AF_INET, (const void *)(buf + offset),
+-                          host, INET_ADDRSTRLEN);
+-            }
+-            offset += in_addr_len;
+-        }
+-    } else if ((atyp & ADDRTYPE_MASK) == 3) {
+-        // Domain name
+-        uint8_t name_len = *(uint8_t *)(buf + offset);
+-        if (name_len + 4 <= buf_len) {
+-            if (storage != NULL) {
+-                char tmp[MAX_HOSTNAME_LEN] = { 0 };
+-                struct cork_ip ip;
+-                memcpy(tmp, buf + offset + 1, name_len);
+-                if (cork_ip_init(&ip, tmp) != -1) {
+-                    if (ip.version == 4) {
+-                        struct sockaddr_in *addr = (struct sockaddr_in *)storage;
+-                        inet_pton(AF_INET, tmp, &(addr->sin_addr));
+-                        memcpy(&addr->sin_port, buf + offset + 1 + name_len, sizeof(uint16_t));
+-                        addr->sin_family = AF_INET;
+-                    } else if (ip.version == 6) {
+-                        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)storage;
+-                        inet_pton(AF_INET, tmp, &(addr->sin6_addr));
+-                        memcpy(&addr->sin6_port, buf + offset + 1 + name_len, sizeof(uint16_t));
+-                        addr->sin6_family = AF_INET6;
+-                    }
+-                }
+-            }
+-            if (host != NULL) {
+-                memcpy(host, buf + offset + 1, name_len);
+-            }
+-            offset += 1 + name_len;
+-        }
+-    } else if ((atyp & ADDRTYPE_MASK) == 4) {
+-        // IP V6
+-        size_t in6_addr_len = sizeof(struct in6_addr);
+-        if (buf_len >= in6_addr_len + 3) {
+-            if (storage != NULL) {
+-                struct sockaddr_in6 *addr = (struct sockaddr_in6 *)storage;
+-                addr->sin6_family = AF_INET6;
+-                memcpy(&addr->sin6_addr, buf + offset, sizeof(struct in6_addr));
+-                memcpy(&addr->sin6_port, buf + offset + in6_addr_len, sizeof(uint16_t));
+-            }
+-            if (host != NULL) {
+-                inet_ntop(AF_INET6, (const void *)(buf + offset),
+-                          host, INET6_ADDRSTRLEN);
+-            }
+-            offset += in6_addr_len;
+-        }
+-    }
+-
+-    if (offset == 1) {
+-        LOGE("[udp] invalid header with addr type %d", atyp);
+-        return 0;
+-    }
+-
+-    if (port != NULL) {
+-        sprintf(port, "%d", load16_be(buf + offset));
+-    }
+-    offset += 2;
+-
+-    return offset;
++    memset(out_key, 0, HASH_KEY_LEN);
++    memcpy(out_key, &af, sizeof(int));
++    memcpy(out_key + sizeof(int), (const uint8_t *)addr, sizeof(struct sockaddr_storage));
+ }
+ 
+ static char *
+@@ -317,38 +172,40 @@ get_addr_str(const struct sockaddr *sa, bool has_port)
+ int
+ create_remote_socket(int ipv6)
+ {
+-    int remote_sock;
++    int remote_sock = -1;
+ 
+     if (ipv6) {
+-        // Try to bind IPv6 first
+-        struct sockaddr_in6 addr;
+-        memset(&addr, 0, sizeof(struct sockaddr_in6));
+-        addr.sin6_family = AF_INET6;
+-        addr.sin6_addr   = in6addr_any;
+-        addr.sin6_port   = 0;
+-        remote_sock      = socket(AF_INET6, SOCK_DGRAM, 0);
++        struct sockaddr_in6 addr6;
++        memset(&addr6, 0, sizeof(addr6));
++        addr6.sin6_family = AF_INET6;
++        addr6.sin6_addr = in6addr_any;
++        addr6.sin6_port = 0;
++
++        remote_sock = socket(AF_INET6, SOCK_DGRAM, 0);
+         if (remote_sock == -1) {
+-            ERROR("[udp] cannot create socket");
++            ERROR("[udp] cannot create IPv6 socket");
+             return -1;
+         }
+-        if (bind(remote_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+-            FATAL("[udp] cannot bind socket");
++        if (bind(remote_sock, (struct sockaddr *)&addr6, sizeof(addr6)) != 0) {
++            ERROR("[udp] cannot bind IPv6 socket");
++            close(remote_sock);
+             return -1;
+         }
+     } else {
+-        // Or else bind to IPv4
+-        struct sockaddr_in addr;
+-        memset(&addr, 0, sizeof(struct sockaddr_in));
+-        addr.sin_family      = AF_INET;
+-        addr.sin_addr.s_addr = INADDR_ANY;
+-        addr.sin_port        = 0;
+-        remote_sock          = socket(AF_INET, SOCK_DGRAM, 0);
++        struct sockaddr_in addr4;
++        memset(&addr4, 0, sizeof(addr4));
++        addr4.sin_family = AF_INET;
++        addr4.sin_addr.s_addr = INADDR_ANY;
++        addr4.sin_port = 0;
++
++        remote_sock = socket(AF_INET, SOCK_DGRAM, 0);
+         if (remote_sock == -1) {
+-            ERROR("[udp] cannot create socket");
++            ERROR("[udp] cannot create IPv4 socket");
+             return -1;
+         }
+-        if (bind(remote_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+-            FATAL("[udp] cannot bind remote");
++        if (bind(remote_sock, (struct sockaddr *)&addr4, sizeof(addr4)) != 0) {
++            ERROR("[udp] cannot bind IPv4 socket");
++            close(remote_sock);
+             return -1;
+         }
+     }
+@@ -360,6 +217,7 @@ create_remote_socket(int ipv6)
+     return remote_sock;
+ }
+ 
++
+ int
+ create_server_socket(const char *host, const char *port)
+ {
+@@ -432,12 +290,12 @@ create_server_socket(const char *host, const char *port)
+         int tos   = 46 << 2;
+         int rc = setsockopt(server_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+         if (rc < 0 && errno != ENOPROTOOPT) {
+-            LOGE("setting ipv4 dscp failed: %d", errno);
++            ERROR("setting ipv4 dscp failed");
+         }
+ #ifdef IPV6_TCLASS
+         rc = setsockopt(server_sock, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
+         if (rc < 0 && errno != ENOPROTOOPT) {
+-            LOGE("setting ipv6 dscp failed: %d", errno);
++            ERROR("setting ipv6 dscp failed");
+         }
+ #endif
+ #endif
+@@ -447,12 +305,17 @@ create_server_socket(const char *host, const char *port)
+         int flag_r = rp->ai_family == AF_INET ? IP_RECVORIGDSTADDR : IPV6_RECVORIGDSTADDR;
+ 
+         if (setsockopt(server_sock, sol, flag_t, &opt, sizeof(opt))) {
+-            ERROR("[udp] setsockopt IP_TRANSPARENT");
+-            exit(EXIT_FAILURE);
++            ERROR("[udp] setsockopt IP_TRANSPARENT failed");
++            close(server_sock);
++            server_sock = -1;
++            continue;
+         }
+ 
+         if (setsockopt(server_sock, sol, flag_r, &opt, sizeof(opt))) {
+-            FATAL("[udp] setsockopt IP_RECVORIGDSTADDR");
++            ERROR("[udp] setsockopt IP_RECVORIGDSTADDR failed");
++            close(server_sock);
++            server_sock = -1;
++            continue;
+         }
+ 
+         s = bind(server_sock, rp->ai_addr, rp->ai_addrlen);
+@@ -475,20 +338,26 @@ create_server_socket(const char *host, const char *port)
+ 
+     return server_sock;
+ }
+-
++/* new_remote: 初始化 remote_ctx，remote_idx 初始来自 server_ctx->preferred_remote_idx */
+ remote_ctx_t *
+ new_remote(int fd, server_ctx_t *server_ctx)
+ {
+     remote_ctx_t *ctx = ss_malloc(sizeof(remote_ctx_t));
++    if (!ctx) {
++        ERROR("[udp] out of memory new_remote");
++        close(fd);
++        return NULL;
++    }
+     memset(ctx, 0, sizeof(remote_ctx_t));
+ 
+     ctx->fd         = fd;
+     ctx->server_ctx = server_ctx;
+     ctx->af         = AF_UNSPEC;
++    ctx->remote_idx = 0; /* Will be set properly when used */
++    ctx->state      = STATE_IDLE;
+ 
+     ev_io_init(&ctx->io, remote_recv_cb, fd, EV_READ);
+-    ev_timer_init(&ctx->watcher, remote_timeout_cb, server_ctx->timeout,
+-                  server_ctx->timeout);
++    ev_timer_init(&ctx->watcher, remote_timeout_cb, server_ctx->timeout, server_ctx->timeout);
+ 
+     return ctx;
+ }
+@@ -497,10 +366,10 @@ server_ctx_t *
+ new_server_ctx(int fd)
+ {
+     server_ctx_t *ctx = ss_malloc(sizeof(server_ctx_t));
++    if (!ctx) return NULL;
+     memset(ctx, 0, sizeof(server_ctx_t));
+ 
+     ctx->fd = fd;
+-
+     ev_io_init(&ctx->io, server_recv_cb, fd, EV_READ);
+ 
+     return ctx;
+@@ -517,20 +386,6 @@ close_and_free_remote(EV_P_ remote_ctx_t *ctx)
+     }
+ }
+ 
+-static void
+-remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+-{
+-    remote_ctx_t *remote_ctx
+-        = cork_container_of(watcher, remote_ctx_t, watcher);
+-
+-    if (verbose) {
+-        LOGI("[udp] connection timeout");
+-    }
+-
+-    char *key = hash_key(remote_ctx->af, &remote_ctx->src_addr);
+-    cache_remove(remote_ctx->server_ctx->conn_cache, key, HASH_KEY_LEN);
+-}
+-
+ void convert_ipv4_mapped_ipv6(struct sockaddr_storage* addr) {
+     if (addr->ss_family == AF_INET) {
+         struct sockaddr_in* ipv4_addr = (struct sockaddr_in*)addr;
+@@ -554,122 +409,148 @@ void convert_ipv4_mapped_ipv6(struct sockaddr_storage* addr) {
+     }
+ }
+ 
++/* 当 remote 超时时，尝试将 listener 的 preferred_remote_idx 向后移动一位（failover），并删除 cache */
+ static void
+-remote_recv_cb(EV_P_ ev_io *w, int revents)
++remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
+ {
+-    ssize_t r;
+-    remote_ctx_t *remote_ctx = (remote_ctx_t *)w;
++    remote_ctx_t *remote_ctx = cork_container_of(watcher, remote_ctx_t, watcher);
+     server_ctx_t *server_ctx = remote_ctx->server_ctx;
+ 
+-    // server has been closed
++    ev_timer_stop(EV_A_ & remote_ctx->watcher);
++
+     if (server_ctx == NULL) {
+-        LOGE("[udp] invalid server");
+         close_and_free_remote(EV_A_ remote_ctx);
+         return;
+     }
+ 
++    /* Only perform failover if we were actively awaiting a reply */
++    if (remote_ctx->state == STATE_AWAITING_REPLY) {
++        /* Mark the timed-out remote as down */
++        if (remote_ctx->remote_idx < server_ctx->remote_num) {
++            server_ctx->remote_status[remote_ctx->remote_idx] = false;
++            LOGI("[udp] failover on no-reply: remote %d marked as offline.", remote_ctx->remote_idx);
++
++            /* Find the next available remote for this session */
++            int next_idx = -1;
++            for (int i = 0; i < server_ctx->remote_num; i++) {
++                if (server_ctx->remote_status[i]) {
++                    next_idx = i;
++                    break;
++                }
++            }
++            if (next_idx != -1) remote_ctx->remote_idx = next_idx;
++            /* If no servers are available, subsequent packets will be dropped in server_recv_cb */
++        }
++    } else {
++        if (verbose) LOGI("[udp] idle session timed out, no failover triggered.");
++    }
++
+     if (verbose) {
+-        LOGI("[udp] remote receive a packet");
++        LOGI("[udp] connection timeout for src %s", get_addr_str((struct sockaddr *)&remote_ctx->src_addr, true));
++    }
++
++    /* 使用栈上的 key 以移除 cache 条目（触发 free_cb） */
++    char key[HASH_KEY_LEN];
++    hash_key_fill(key, remote_ctx->af, &remote_ctx->src_addr);
++    cache_remove(server_ctx->conn_cache, key, HASH_KEY_LEN);
++}
++
++/* remote recv: 收到从 remote 发回的加密数据，解密并发回对应的客户端地址 */
++static void
++remote_recv_cb(EV_P_ ev_io *w, int revents)
++{
++    /* safe container_of to get remote_ctx */
++    remote_ctx_t *remote_ctx = cork_container_of(w, remote_ctx_t, io);
++    server_ctx_t *server_ctx = remote_ctx->server_ctx;
++
++    if (server_ctx == NULL) {
++        LOGE("[udp] invalid server_ctx in remote_recv_cb");
++        close_and_free_remote(EV_A_ remote_ctx);
++        return;
+     }
+ 
++    if (verbose) LOGI("[udp] remote receive a packet");
++
+     struct sockaddr_storage src_addr;
+-    socklen_t src_addr_len = sizeof(struct sockaddr_storage);
++    socklen_t src_addr_len = sizeof(src_addr);
+     memset(&src_addr, 0, src_addr_len);
+ 
+     buffer_t *buf = ss_malloc(sizeof(buffer_t));
+     balloc(buf, buf_size);
+ 
+-    // recv
+-    r = recvfrom(remote_ctx->fd, buf->data, buf_size, 0, (struct sockaddr *)&src_addr, &src_addr_len);
+-
++    ssize_t r = recvfrom(remote_ctx->fd, buf->data, buf_size, 0, (struct sockaddr *)&src_addr, &src_addr_len);
+     if (r == -1) {
+-        // error on recv
+-        // simply drop that packet
+         ERROR("[udp] remote_recv_recvfrom");
+         goto CLEAN_UP;
+-    } else if (r > packet_size) {
+-        if (verbose) {
+-            LOGI("[udp] remote_recv_recvfrom fragmentation, MTU at least be: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
+-        }
+     }
+-
++    if (r > packet_size && verbose) {
++        LOGI("[udp] remote_recv fragmentation: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
++    }
+     buf->len = r;
+ 
+     int err = server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+     if (err) {
+-        LOGE("failed to handshake with %s: %s",
+-                get_addr_str((struct sockaddr *)&src_addr, false), "suspicious UDP packet");
+-        // drop the packet silently
++        LOGE("[udp] decrypt_all failed or suspicious packet from %s", get_addr_str((struct sockaddr *)&src_addr, true));
+         goto CLEAN_UP;
+     }
+ 
+     struct sockaddr_storage dst_addr;
+-    memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
++    memset(&dst_addr, 0, sizeof(dst_addr));
+     int len = parse_udprelay_header(buf->data, buf->len, NULL, NULL, &dst_addr);
+-
+-    if (dst_addr.ss_family != AF_INET && dst_addr.ss_family != AF_INET6) {
+-        LOGI("[udp] ss-redir does not support domain name");
+-        goto CLEAN_UP;
+-    }
+-
+     if (len == 0) {
+-        // error when parsing header
+-        LOGE("[udp] error in parse header");
++        LOGE("[udp] parse header failed in remote_recv_cb");
+         goto CLEAN_UP;
+     }
+ 
+-    // Construct packet
+     buf->len -= len;
+     memmove(buf->data, buf->data + len, buf->len);
+ 
+-    if (buf->len > packet_size) {
+-        if (verbose) {
+-            LOGI("[udp] remote_recv_sendto fragmentation, MTU at least be: " SSIZE_FMT, buf->len + PACKET_HEADER_SIZE);
+-        }
++    if (buf->len > packet_size && verbose) {
++        LOGI("[udp] remote_sendto fragmentation MTU maybe: " SSIZE_FMT, buf->len + PACKET_HEADER_SIZE);
+     }
+ 
+     convert_ipv4_mapped_ipv6(&dst_addr);
+ 
+     size_t remote_dst_addr_len = get_sockaddr_len((struct sockaddr *)&dst_addr);
+ 
+-    int src_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+-    if (src_fd < 0) {
++    int reply_fd = socket(AF_INET6, SOCK_DGRAM, 0);
++    if (reply_fd < 0) {
+         ERROR("[udp] remote_recv_socket");
+         goto CLEAN_UP;
+     }
+     int opt = 1;
+-    if (setsockopt(src_fd, SOL_IPV6, IPV6_TRANSPARENT, &opt, sizeof(opt))) {
++    if (setsockopt(reply_fd, SOL_IPV6, IPV6_TRANSPARENT, &opt, sizeof(opt))) {
+         ERROR("[udp] remote_recv_setsockopt");
+-        close(src_fd);
++        close(reply_fd);
+         goto CLEAN_UP;
+     }
+-    if (setsockopt(src_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
++    if (setsockopt(reply_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+         ERROR("[udp] remote_recv_setsockopt");
+-        close(src_fd);
++        close(reply_fd);
+         goto CLEAN_UP;
+     }
+     if (reuse_port) {
+-        if (set_reuseport(src_fd) != 0) {
++        if (set_reuseport(reply_fd) != 0) {
+             ERROR("[udp] remote_recv port_reuse");
+         }
+     }
+ #ifdef IP_TOS
+     // Set QoS flag
+     int tos = 46 << 2;
+-    int rc = setsockopt(src_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
++    int rc = setsockopt(reply_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+     if (rc < 0 && errno != ENOPROTOOPT) {
+         LOGE("setting ipv4 dscp failed: %d", errno);
+     }
+ #ifdef IPV6_TCLASS
+-    rc = setsockopt(src_fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
++    rc = setsockopt(reply_fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
+     if (rc < 0 && errno != ENOPROTOOPT) {
+         LOGE("setting ipv6 dscp failed: %d", errno);
+     }
+ #endif
+ #endif
+-    if (bind(src_fd, (struct sockaddr *)&dst_addr, remote_dst_addr_len) != 0) {
++    if (bind(reply_fd, (struct sockaddr *)&dst_addr, remote_dst_addr_len) != 0) {
+         ERROR("[udp] remote_recv_bind");
+-        close(src_fd);
++        close(reply_fd);
+         goto CLEAN_UP;
+     }
+ 
+@@ -679,21 +560,22 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+ 
+     size_t remote_src_addr_len = get_sockaddr_len((struct sockaddr *)&mapped_src_addr);
+ 
+-    int s = sendto(src_fd, buf->data, buf->len, 0,
++    ssize_t s = sendto(reply_fd, buf->data, buf->len, 0,
+                    (struct sockaddr *)&mapped_src_addr, remote_src_addr_len);
++
++    close(reply_fd);
++
+     if (s == -1 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
+-        ERROR("[udp] remote_recv_sendto");
+-        close(src_fd);
+-        goto CLEAN_UP;
++        ERROR("[udp] remote_recv sendto to client failed");
+     }
+-    close(src_fd);
+ 
+-    // handle the UDP packet successfully,
+-    // triger the timer
++    /* Mark as idle since we've successfully processed a reply */
++    remote_ctx->state = STATE_IDLE;
++
++    /* 成功收到回包後，重置 remote 的 watcher（延長可用時間） */
+     ev_timer_again(EV_A_ & remote_ctx->watcher);
+ 
+ CLEAN_UP:
+-
+     bfree(buf);
+     ss_free(buf);
+ }
+@@ -702,160 +584,121 @@ CLEAN_UP:
+ static void
+ server_recv_cb(EV_P_ ev_io *w, int revents)
+ {
+-    server_ctx_t *server_ctx = (server_ctx_t *)w;
+-    struct sockaddr_storage src_addr;
+-    memset(&src_addr, 0, sizeof(struct sockaddr_storage));
++    /* get server_ctx by container_of (safer than casting) */
++    server_ctx_t *server_ctx = cork_container_of(w, server_ctx_t, io);
+ 
+     buffer_t *buf = ss_malloc(sizeof(buffer_t));
+     balloc(buf, buf_size);
+ 
+-    socklen_t src_addr_len = sizeof(struct sockaddr_storage);
+-    unsigned int offset    = 0;
+-
+-    char control_buffer[64] = { 0 };
+-    struct msghdr msg;
+-    memset(&msg, 0, sizeof(struct msghdr));
++    struct msghdr msgh;
+     struct iovec iov[1];
+-    struct sockaddr_storage dst_addr;
+-    memset(&dst_addr, 0, sizeof(struct sockaddr_storage));
++    char cbuf[CMSG_SPACE(sizeof(struct sockaddr_in6))];
++    struct sockaddr_storage src_addr, dst_addr;
++
++    memset(&src_addr, 0, sizeof(src_addr));
++    memset(&dst_addr, 0, sizeof(dst_addr));
+ 
+-    msg.msg_name       = &src_addr;
+-    msg.msg_namelen    = src_addr_len;
+-    msg.msg_control    = control_buffer;
+-    msg.msg_controllen = sizeof(control_buffer);
++    /* IMPORTANT: initialize msgh to zero to avoid uninitialized fields */
++    memset(&msgh, 0, sizeof(msgh));
+ 
+     iov[0].iov_base = buf->data;
+-    iov[0].iov_len  = buf_size;
+-    msg.msg_iov     = iov;
+-    msg.msg_iovlen  = 1;
++    iov[0].iov_len = buf_size;
+ 
+-    buf->len = recvmsg(server_ctx->fd, &msg, 0);
+-    if (buf->len == -1) {
+-        ERROR("[udp] server_recvmsg");
+-        goto CLEAN_UP;
+-    } else if (buf->len > packet_size) {
+-        if (verbose) {
+-            LOGI("[udp] UDP server_recv_recvmsg fragmentation, MTU at least be: " SSIZE_FMT,
+-                 buf->len + PACKET_HEADER_SIZE);
+-        }
+-    }
++    msgh.msg_name = &src_addr;
++    msgh.msg_namelen = sizeof(src_addr);
++    msgh.msg_iov = iov;
++    msgh.msg_iovlen = 1;
++    msgh.msg_control = cbuf;
++    msgh.msg_controllen = sizeof(cbuf);
++    msgh.msg_flags = 0;
+ 
+-    if (get_dstaddr(&msg, &dst_addr)) {
+-        LOGE("[udp] unable to get dest addr");
++    ssize_t r = recvmsg(server_ctx->fd, &msgh, 0);
++    if (r == -1) {
++        ERROR("[udp] server_recv_recvfrom");
+         goto CLEAN_UP;
+     }
+ 
+-    src_addr_len = msg.msg_namelen;
++    if (r > packet_size && verbose) {
++        LOGI("[udp] server_recv_recvfrom fragmentation: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
++    }
++    buf->len = r;
+ 
+-    if (verbose) {
+-        LOGI("[udp] server receive a packet");
++    struct cmsghdr *cmsg;
++    for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL; cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
++        if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVORIGDSTADDR) {
++            memcpy(&dst_addr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in));
++        } else if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_RECVORIGDSTADDR) {
++            memcpy(&dst_addr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in6));
++        }
+     }
+ 
+-    /*
+-     *
+-     * SOCKS5 UDP Request
+-     * +----+------+------+----------+----------+----------+
+-     * |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+-     * +----+------+------+----------+----------+----------+
+-     * | 2  |  1   |  1   | Variable |    2     | Variable |
+-     * +----+------+------+----------+----------+----------+
+-     *
+-     * SOCKS5 UDP Response
+-     * +----+------+------+----------+----------+----------+
+-     * |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+-     * +----+------+------+----------+----------+----------+
+-     * | 2  |  1   |  1   | Variable |    2     | Variable |
+-     * +----+------+------+----------+----------+----------+
+-     *
+-     * shadowsocks UDP Request (before encrypted)
+-     * +------+----------+----------+----------+
+-     * | ATYP | DST.ADDR | DST.PORT |   DATA   |
+-     * +------+----------+----------+----------+
+-     * |  1   | Variable |    2     | Variable |
+-     * +------+----------+----------+----------+
+-     *
+-     * shadowsocks UDP Response (before encrypted)
+-     * +------+----------+----------+----------+
+-     * | ATYP | DST.ADDR | DST.PORT |   DATA   |
+-     * +------+----------+----------+----------+
+-     * |  1   | Variable |    2     | Variable |
+-     * +------+----------+----------+----------+
+-     *
+-     * shadowsocks UDP Request and Response (after encrypted)
+-     * +-------+--------------+
+-     * |   IV  |    PAYLOAD   |
+-     * +-------+--------------+
+-     * | Fixed |   Variable   |
+-     * +-------+--------------+
+-     *
+-     */
++    if (dst_addr.ss_family == AF_UNSPEC) {
++        LOGE("[udp] could not get original destination address for TPROXY "
++             "(is it enabled and configured correctly?)");
++        goto CLEAN_UP;
++    }
+ 
+-    char addr_header[MAX_ADDR_HEADER_SIZE] = { 0 };
+-    int addr_header_len                    = construct_udprelay_header(&dst_addr, addr_header);
++    if (verbose) LOGI("[udp] server receive a packet from %s", get_addr_str((struct sockaddr *)&src_addr, true));
+ 
++    char addr_header[MAX_ADDR_HEADER_SIZE] = {0};
++    int addr_header_len = construct_udprelay_header(&dst_addr, addr_header);
+     if (addr_header_len == 0) {
+-        LOGE("[udp] failed to parse tproxy addr");
++        LOGE("[udp] failed to construct addr header (tproxy)");
+         goto CLEAN_UP;
+     }
+-
+-    // reconstruct the buffer
+     brealloc(buf, buf->len + addr_header_len, buf_size);
+     memmove(buf->data + addr_header_len, buf->data, buf->len);
+     memcpy(buf->data, addr_header, addr_header_len);
+     buf->len += addr_header_len;
+ 
+-    char *key = hash_key(server_ctx->remote_addr->sa_family, &src_addr);
++    /* key: 用 src_addr + family 作为 cache key */
++    char key[HASH_KEY_LEN];
++    hash_key_fill(key, src_addr.ss_family, &src_addr);
+ 
+     struct cache *conn_cache = server_ctx->conn_cache;
+-
+     remote_ctx_t *remote_ctx = NULL;
+     cache_lookup(conn_cache, key, HASH_KEY_LEN, (void *)&remote_ctx);
+ 
+-    if (remote_ctx != NULL) {
+-        if (sockaddr_cmp(&src_addr, &remote_ctx->src_addr, sizeof(src_addr))) {
++    /* 校验 cache 里的 remote_ctx 是否属于相同的 src_addr（防止 hash 冲突） */
++    if (remote_ctx) {
++        if (sockaddr_cmp(&src_addr, &remote_ctx->src_addr, sizeof(src_addr)) != 0) {
++            /* 不同 src_addr 的 entry，不复用（hash 冲突） */
+             remote_ctx = NULL;
+         }
+     }
+ 
+-    // reset the timer
+-    if (remote_ctx != NULL) {
++    if (remote_ctx) {
++        /* cache 命中：重置 timer */
+         ev_timer_again(EV_A_ & remote_ctx->watcher);
+-    }
++        if (verbose) LOGI("[udp] cache hit for %s", get_addr_str((struct sockaddr *)&src_addr, true));
++    } else {
++        if (verbose) LOGI("[udp] cache miss for %s, creating remote_ctx", get_addr_str((struct sockaddr *)&src_addr, true));
+ 
+-    if (remote_ctx == NULL) {
+-        if (verbose) {
+-            char src[SS_ADDRSTRLEN];
+-            char dst[SS_ADDRSTRLEN];
+-            strcpy(src, get_addr_str((struct sockaddr *)&src_addr, true));
+-            strcpy(dst, get_addr_str((struct sockaddr *)&dst_addr, true));
+-            LOGI("[%s] [udp] cache miss: %s <-> %s", s_port, dst, src);
++        /* Find first available remote */
++        int start_idx = -1;
++        for (int i = 0; i < server_ctx->remote_num; i++) {
++            if (server_ctx->remote_status[i]) {
++                start_idx = i;
++                break;
++            }
+         }
+-    } else {
+-        if (verbose) {
+-            char src[SS_ADDRSTRLEN];
+-            char dst[SS_ADDRSTRLEN];
+-            strcpy(src, get_addr_str((struct sockaddr *)&src_addr, true));
+-            strcpy(dst, get_addr_str((struct sockaddr *)&dst_addr, true));
+-            LOGI("[%s] [udp] cache hit: %s <-> %s", s_port, dst, src);
++        if (start_idx == -1) {
++            LOGE("[udp] No remote servers available, dropping packet.");
++            goto CLEAN_UP;
+         }
+-    }
+-
+-    const struct sockaddr *remote_addr = server_ctx->remote_addr;
+-    const int remote_addr_len          = server_ctx->remote_addr_len;
++        const struct sockaddr *start_remote_addr = server_ctx->remote_addr[start_idx];
++        int prefer_is_v6 = start_remote_addr->sa_family == AF_INET6 ? 1 : 0;
+ 
+-    if (remote_ctx == NULL) {
+-        // Bind to any port
+-        int remotefd = create_remote_socket(remote_addr->sa_family == AF_INET6);
++        int remotefd = create_remote_socket(prefer_is_v6);
+         if (remotefd < 0) {
+-            ERROR("[udp] udprelay bind() error");
++            ERROR("[udp] create_remote_socket failed");
+             goto CLEAN_UP;
+         }
+         setnonblocking(remotefd);
+ 
+ #ifdef SO_MARK
+         if (server_ctx->fwmark > 0) {
+-            if (setsockopt(remotefd, SOL_SOCKET, SO_MARK, &server_ctx->fwmark,
+-                           sizeof(server_ctx->fwmark)) != 0) {
++            if (setsockopt(remotefd, SOL_SOCKET, SO_MARK, &server_ctx->fwmark, sizeof(server_ctx->fwmark)) != 0) {
+                 ERROR("setsockopt SO_MARK");
+             }
+         }
+@@ -864,6 +707,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+ #ifdef SO_NOSIGPIPE
+         set_nosigpipe(remotefd);
+ #endif
++
+ #ifdef IP_TOS
+         // Set QoS flag
+         int tos = 46 << 2;
+@@ -878,108 +722,144 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+         }
+ #endif
+ #endif
++
+ #ifdef SET_INTERFACE
+-        if (server_ctx->iface) {
+-            if (setinterface(remotefd, server_ctx->iface) == -1)
+-                ERROR("setinterface");
++        if (server_ctx->iface && strlen(server_ctx->iface) > 0) {
++            if (setinterface(remotefd, server_ctx->iface) == -1) ERROR("setinterface");
+         }
+ #endif
+ 
+-        // Init remote_ctx
+-        remote_ctx           = new_remote(remotefd, server_ctx);
+-        remote_ctx->src_addr = src_addr;
+-        remote_ctx->af       = remote_addr->sa_family;
++        /* 新建 remote_ctx */
++        remote_ctx = new_remote(remotefd, server_ctx);
++        if (!remote_ctx) {
++            close(remotefd);
++            goto CLEAN_UP;
++        }
++        remote_ctx->src_addr = src_addr; /* 保存客户端地址 */
++        remote_ctx->af = src_addr.ss_family;
++        remote_ctx->remote_idx = start_idx;
+ 
+-        // Add to conn cache
++        /* 插入 cache（cache 应复制 key 内容） */
+         cache_insert(conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
+ 
+-        // Start remote io
+         ev_io_start(EV_A_ & remote_ctx->io);
+         ev_timer_start(EV_A_ & remote_ctx->watcher);
+     }
+ 
+-    if (offset > 0) {
+-        buf->len -= offset;
+-        memmove(buf->data, buf->data + offset, buf->len);
++    /*
++     * If the remote for this session is now offline, we must failover.
++     * This is an "in-session" failover.
++     */
++    if (!server_ctx->remote_status[remote_ctx->remote_idx]) {
++        int next_idx = -1;
++        for (int i = 0; i < server_ctx->remote_num; i++) {
++            if (server_ctx->remote_status[i]) {
++                next_idx = i;
++                break;
++            }
++        }
++        if (next_idx != -1) {
++            LOGI("[udp] in-session failover for %s: %d -> %d", get_addr_str((struct sockaddr *)&src_addr, true), remote_ctx->remote_idx, next_idx);
++            remote_ctx->remote_idx = next_idx;
++        }
+     }
++    const struct sockaddr *remote_addr = server_ctx->remote_addr[remote_ctx->remote_idx];
++    int remote_addr_len = get_sockaddr_len((struct sockaddr *)remote_addr);
+ 
++    /* 对 payload 进行加密 */
+     int err = server_ctx->crypto->encrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+-
+     if (err) {
+-        // drop the packet silently
++        LOGE("[udp] encrypt_all failed, drop packet");
+         goto CLEAN_UP;
+     }
+ 
+-    if (buf->len > packet_size) {
+-        if (verbose) {
+-            LOGI("[udp] server_recv_sendto fragmentation, MTU at least be: " SSIZE_FMT, buf->len + PACKET_HEADER_SIZE);
+-        }
++    if (buf->len > packet_size && verbose) {
++        LOGI("[udp] sending possibly fragmented UDP packet to remote (len=%d)", (int)buf->len);
+     }
+ 
+     int s = sendto(remote_ctx->fd, buf->data, buf->len, 0, remote_addr, remote_addr_len);
+-
++    if (remote_ctx) remote_ctx->state = STATE_AWAITING_REPLY;
+     if (s == -1) {
+-        ERROR("[udp] server_recv_sendto");
++        if (errno != EAGAIN && errno != EWOULDBLOCK) {
++            ERROR("[udp] server->sendto to remote failed");
++            /* If send fails immediately, mark remote as down and destroy this session */
++            if (server_ctx->remote_num > 1) {
++                server_ctx->remote_status[remote_ctx->remote_idx] = false;
++                LOGI("[udp] sendto failed, marking remote index %d as offline", remote_ctx->remote_idx);
++
++                /* Remove from cache to force re-creation on next packet */
++                char key_to_remove[HASH_KEY_LEN];
++                hash_key_fill(key_to_remove, remote_ctx->af, &remote_ctx->src_addr);
++                cache_remove(conn_cache, key_to_remove, HASH_KEY_LEN);
++                remote_ctx = NULL; /* Prevent timer reset below */
++            }
++        }
++    } else {
++        /* send 成功时，重置 timer（在某些情况下 sendto 成功不会触发 remote 的回包计时，仍然用 watcher 来判断无响应） */
++        if (remote_ctx)
++            ev_timer_again(EV_A_ & remote_ctx->watcher);
+     }
+ 
+ CLEAN_UP:
+     bfree(buf);
+     ss_free(buf);
++    return;
+ }
+ 
++/* cache free callback: 由 cache 在删除条目时调用（移除 remote_ctx） */
+ void
+ free_cb(void *key, void *element)
+ {
+     remote_ctx_t *remote_ctx = (remote_ctx_t *)element;
+-    if (verbose) {
+-        LOGI("[udp] one connection freed");
+-    }
+-
+-    close_and_free_remote(EV_DEFAULT, remote_ctx);
++    if (verbose) LOGI("[udp] freeing remote_ctx %p", (void *)remote_ctx);
++    if (remote_ctx) close_and_free_remote(EV_DEFAULT, remote_ctx);
+ }
+ 
++/* 初始化 udprelay，支持多个 remote_addr，记录 preferred_remote_idx 并注册 failback timer */
+ int
+-init_udprelay(const char *server_host, const char *server_port,
+-              const struct sockaddr *remote_addr, const int remote_addr_len,
+-              int mtu, crypto_t *crypto, int timeout, const char *iface, int fwmark)
++init_udprelay(const char *server_host, const char *server_port, int remote_num,
++              struct sockaddr **remote_addr, int mtu, crypto_t *crypto,
++              int timeout, const char *iface, int fwmark,
++              volatile bool *remote_status)
+ {
+     s_port = server_port;
+-    // Initialize ev loop
+     struct ev_loop *loop = EV_DEFAULT;
+ 
+-    // Initialize MTU
+     if (mtu > 0) {
+         packet_size = mtu - PACKET_HEADER_SIZE;
+-        buf_size    = packet_size * 2;
++        buf_size = packet_size * 2;
+     }
+ 
+-    // ////////////////////////////////////////////////
+-    // Setup server context
+-
+-    // Bind to port
+     int serverfd = create_server_socket(server_host, server_port);
+-    if (serverfd < 0) {
+-        return -1;
+-    }
++    if (serverfd < 0) return -1;
+     setnonblocking(serverfd);
+ 
+-    // Initialize cache
+-    struct cache *conn_cache;
++    struct cache *conn_cache = NULL;
+     cache_create(&conn_cache, MAX_UDP_CONN_NUM, free_cb);
+ 
+     server_ctx_t *server_ctx = new_server_ctx(serverfd);
+-    server_ctx->timeout    = max(timeout, MIN_UDP_TIMEOUT);
+-    server_ctx->crypto     = crypto;
+-    server_ctx->iface      = iface;
++    if (!server_ctx) {
++        close(serverfd);
++        return -1;
++    }
++
++    server_ctx->timeout = max(timeout, MIN_UDP_TIMEOUT);
++    server_ctx->crypto = crypto;
++    server_ctx->iface = iface;
+     server_ctx->conn_cache = conn_cache;
+     server_ctx->fwmark = fwmark;
+-    server_ctx->remote_addr     = remote_addr;
+-    server_ctx->remote_addr_len = remote_addr_len;
++    server_ctx->remote_num = remote_num;
++    server_ctx->remote_addr = remote_addr;
++    server_ctx->remote_status = remote_status;
+ 
+     ev_io_start(loop, &server_ctx->io);
+ 
+-    server_ctx_list[server_num++] = server_ctx;
+-
++    if (server_num < MAX_REMOTE_NUM) {
++        server_ctx_list[server_num++] = server_ctx;
++    } else {
++        LOGE("[udp] too many server instances");
++    }
++    probe_add_udp_server(server_ctx);
+     return serverfd;
+ }
+ 
+@@ -990,6 +870,9 @@ free_udprelay()
+     while (server_num > 0) {
+         server_ctx_t *server_ctx = server_ctx_list[--server_num];
+         ev_io_stop(loop, &server_ctx->io);
++        /* Use a temporary variable to hold the pointer for ss_free */
++        void *status_ptr = (void *)server_ctx->remote_status;
++        ss_free(status_ptr);
+         close(server_ctx->fd);
+         cache_delete(server_ctx->conn_cache, 0);
+ #ifdef MODULE_LOCAL
+diff --git a/src/udprelay.h b/src/udprelay.h
+index 8f071dc..5229abf 100644
+--- a/src/udprelay.h
++++ b/src/udprelay.h
+@@ -51,18 +51,26 @@ typedef struct server_ctx {
+     int timeout;
+     const char *iface;
+     struct cache *conn_cache;
+-    const struct sockaddr *remote_addr;
+-    int remote_addr_len;
++    int remote_num;
++    struct sockaddr **remote_addr;
+     int fwmark;
++    volatile bool *remote_status;
+ } server_ctx_t;
+ 
++typedef enum {
++    STATE_IDLE,
++    STATE_AWAITING_REPLY
++} remote_state_t;
++
+ typedef struct remote_ctx {
+     ev_io io;
+     ev_timer watcher;
+     int af;
+     int fd;
+     struct sockaddr_storage src_addr;
+-    struct server_ctx *server_ctx;
++    remote_state_t state;
++    server_ctx_t *server_ctx;
++    int remote_idx;
+ } remote_ctx_t;
+ 
+ #endif // _UDPRELAY_H
+diff --git a/src/utils.c b/src/utils.c
+index ff4a16b..cae0d7c 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -65,6 +65,16 @@ ERROR(const char *s)
+ 
+ int use_tty = 1;
+ 
++int
++setnonblocking(int fd)
++{
++    int flags;
++    if (-1 == (flags = fcntl(fd, F_GETFL, 0))) {
++        flags = 0;
++    }
++    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++}
++
+ char *
+ ss_itoa(int i)
+ {
+@@ -364,6 +374,16 @@ usage()
+         "       [--plugin-opts <options>]  Set SIP003 plugin options. (Experimental)\n");
+     printf(
+         "       [--fwmark <mark>]          Set firewall mark for outgoing packets.\n");
++    printf(
++        "       [--probe-interval <secs>]  Interval in seconds for active remote server probing (default: 60).\n");
++    printf(
++        "       [--probe-timeout <secs>]   Timeout in seconds for active remote server probing (default: 5).\n");
++    printf(
++        "       [--probe-up-count <cnt>]   Success count to mark a remote as up (default: 3).\n");
++    printf(
++        "       [--probe-down-count <cnt>] Failure count to mark a remote as down (default: 3).\n");
++    printf(
++        "       [--probe-domain <domain>]  Domain to use for probing (default: www.google.com).\n");
+     printf("\n");
+     printf(
+         "       [-v]                       Verbose mode.\n");
+diff --git a/src/utils.h b/src/utils.h
+index 1df24c1..657b752 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -222,6 +222,7 @@ int run_as(const char *user);
+ void FATAL(const char *msg);
+ void usage(void);
+ void daemonize(const char *path);
++int setnonblocking(int fd);
+ char *ss_strndup(const char *s, size_t n);
+ #ifdef HAVE_SETRLIMIT
+ int set_nofile(int nofile);
+-- 
+2.37.1 (Apple Git-137.1)
+
