@@ -1,7 +1,7 @@
-From 1fde89f074572c4965275ed46381296544e5f13d Mon Sep 17 00:00:00 2001
+From 17b9b658492e21954fa81aee88632638fdc4c36a Mon Sep 17 00:00:00 2001
 From: zhenglixin <lixin.zhenglx@gmail.com>
 Date: Mon, 22 Sep 2025 21:38:55 +0800
-Subject: [PATCH 3/9] add fwmark
+Subject: [PATCH 3/8] add fwmark
 
 ---
  src/common.h   |  3 ++-
@@ -12,14 +12,14 @@ Subject: [PATCH 3/9] add fwmark
  src/redir.c    | 20 +++++++++++++++++++-
  src/udprelay.c | 14 ++++++++++++--
  src/udprelay.h |  1 +
- src/utils.c    |  2 --
- 9 files changed, 46 insertions(+), 9 deletions(-)
+ src/utils.c    |  4 ++--
+ 9 files changed, 48 insertions(+), 9 deletions(-)
 
 diff --git a/src/common.h b/src/common.h
-index 8a934f7..68c78f4 100644
+index 9a39a98..5ed9a42 100644
 --- a/src/common.h
 +++ b/src/common.h
-@@ -34,7 +34,7 @@
+@@ -30,7 +30,7 @@
  
  int init_udprelay(const char *server_host, const char *server_port,
                    const struct sockaddr *remote_addr, const int remote_addr_len,
@@ -28,7 +28,7 @@ index 8a934f7..68c78f4 100644
  
  void free_udprelay(void);
  
-@@ -57,6 +57,7 @@ enum {
+@@ -53,6 +53,7 @@ enum {
      GETOPT_VAL_PLUGIN_OPTS,
      GETOPT_VAL_PASSWORD,
      GETOPT_VAL_KEY,
@@ -37,7 +37,7 @@ index 8a934f7..68c78f4 100644
  
  #endif // _COMMON_H
 diff --git a/src/crypto.c b/src/crypto.c
-index 76c426b..2795f93 100644
+index 508dbbb..d8a554e 100644
 --- a/src/crypto.c
 +++ b/src/crypto.c
 @@ -24,7 +24,7 @@
@@ -176,7 +176,7 @@ index 0c33d76..17c5e4e 100644
  
          if (mode == UDP_ONLY) {
 diff --git a/src/udprelay.c b/src/udprelay.c
-index b91dbed..eed7081 100644
+index ec87cf3..2acfa6a 100644
 --- a/src/udprelay.c
 +++ b/src/udprelay.c
 @@ -40,7 +40,7 @@
@@ -188,7 +188,7 @@ index b91dbed..eed7081 100644
  #include <net/if.h>
  #include <sys/ioctl.h>
  #define SET_INTERFACE
-@@ -963,6 +963,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+@@ -802,6 +802,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
          }
          setnonblocking(remotefd);
  
@@ -204,7 +204,7 @@ index b91dbed..eed7081 100644
  #ifdef SO_NOSIGPIPE
          set_nosigpipe(remotefd);
  #endif
-@@ -1042,7 +1051,7 @@ free_cb(void *key, void *element)
+@@ -880,7 +889,7 @@ free_cb(void *key, void *element)
  int
  init_udprelay(const char *server_host, const char *server_port,
                const struct sockaddr *remote_addr, const int remote_addr_len,
@@ -213,7 +213,7 @@ index b91dbed..eed7081 100644
  {
      s_port = server_port;
      // Initialize ev loop
-@@ -1073,6 +1082,7 @@ init_udprelay(const char *server_host, const char *server_port,
+@@ -911,6 +920,7 @@ init_udprelay(const char *server_host, const char *server_port,
      server_ctx->crypto     = crypto;
      server_ctx->iface      = iface;
      server_ctx->conn_cache = conn_cache;
@@ -222,22 +222,22 @@ index b91dbed..eed7081 100644
      server_ctx->remote_addr_len = remote_addr_len;
  
 diff --git a/src/udprelay.h b/src/udprelay.h
-index 7242491..b2baf01 100644
+index 132c9cc..8f071dc 100644
 --- a/src/udprelay.h
 +++ b/src/udprelay.h
-@@ -65,6 +65,7 @@ typedef struct server_ctx {
- #ifdef MODULE_REMOTE
-     struct ev_loop *loop;
- #endif
+@@ -53,6 +53,7 @@ typedef struct server_ctx {
+     struct cache *conn_cache;
+     const struct sockaddr *remote_addr;
+     int remote_addr_len;
 +    int fwmark;
  } server_ctx_t;
  
- #ifdef MODULE_REMOTE
+ typedef struct remote_ctx {
 diff --git a/src/utils.c b/src/utils.c
-index 4eb601b..d4186a8 100644
+index fd8ec58..142e322 100644
 --- a/src/utils.c
 +++ b/src/utils.c
-@@ -354,10 +354,8 @@ usage()
+@@ -344,10 +344,8 @@ usage()
          "                                  with Linux kernel > 3.7.0.\n");
      printf(
          "       [--mtu <MTU>]              MTU of your network interface.\n");
@@ -248,6 +248,15 @@ index 4eb601b..d4186a8 100644
      printf(
          "       [--no-delay]               Enable TCP_NODELAY.\n");
      printf(
+@@ -356,6 +354,8 @@ usage()
+         "       [--plugin <name>]          Enable SIP003 plugin. (Experimental)\n");
+     printf(
+         "       [--plugin-opts <options>]  Set SIP003 plugin options. (Experimental)\n");
++    printf(
++        "       [--fwmark <mark>]          Set firewall mark for outgoing packets.\n");
+     printf("\n");
+     printf(
+         "       [-v]                       Verbose mode.\n");
 -- 
 2.37.1 (Apple Git-137.1)
 

@@ -15,7 +15,7 @@ PKG_INSTALL:=1
 PKG_FIXUP:=autoreconf
 PKG_USE_MIPS16:=0
 PKG_BUILD_PARALLEL:=1
-PKG_BUILD_DEPENDS:=c-ares libev libpthread libsodium mbedtls pcre
+PKG_BUILD_DEPENDS:=c-ares libev libsodium mbedtls pcre
 
 include $(INCLUDE_DIR)/package.mk
 

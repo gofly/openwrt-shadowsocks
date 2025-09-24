@@ -1,0 +1,711 @@
+From 2db1ed85e92e5036346124969bab000a3c88edd6 Mon Sep 17 00:00:00 2001
+From: zhenglixin <lixin.zhenglx@gmail.com>
+Date: Wed, 24 Sep 2025 21:15:09 +0800
+Subject: [PATCH 6/8] both listen to IPv4 and IPv6
+
+---
+ doc/ss-redir.asciidoc   |   4 --
+ docker/alpine/README.md |   1 -
+ src/CMakeLists.txt      |   2 +-
+ src/jconf.c             |   6 --
+ src/jconf.h             |   3 -
+ src/netutils.c          |  69 +++++++++++++---------
+ src/netutils.h          |   6 +-
+ src/redir.c             | 106 ++++++++++++++++-----------------
+ src/redir.h             |   3 -
+ src/shadowsocks.h       |   2 -
+ src/udprelay.c          | 126 ++++++++++++++++++----------------------
+ src/utils.c             |   4 +-
+ 12 files changed, 154 insertions(+), 178 deletions(-)
+
+diff --git a/doc/ss-redir.asciidoc b/doc/ss-redir.asciidoc
+index ea15ef3..9ac228a 100644
+--- a/doc/ss-redir.asciidoc
++++ b/doc/ss-redir.asciidoc
+@@ -83,10 +83,6 @@ Specify max number of open files.
+ +
+ Only available on Linux.
+ 
+--b <local_address>::
+-Specify the local address to use while this client is making outbound 
+-connections to the server.
+-
+ -u::
+ Enable UDP relay.
+ +
+diff --git a/docker/alpine/README.md b/docker/alpine/README.md
+index 04ae9ed..52a0ab5 100644
+--- a/docker/alpine/README.md
++++ b/docker/alpine/README.md
+@@ -107,7 +107,6 @@ Don't forget to share internet with your friends.
+ {
+     "server": "your-vps-ip",
+     "server_port": 8388,
+-    "local_address": "0.0.0.0",
+     "local_port": 1080,
+     "password": "9MLSpPmNt",
+     "timeout": 600,
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index bc331bb..88401e3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -26,7 +26,7 @@ set(SS_REDIR_SOURCE
+         ${SS_SHARED_SOURCES}
+         udprelay.c
+         probe.c
+-        metrics.
++        metrics.c
+         cache.c
+         redir.c
+         ${SS_CRYPTO_SOURCE}
+diff --git a/src/jconf.c b/src/jconf.c
+index c475c82..60d8843 100644
+--- a/src/jconf.c
++++ b/src/jconf.c
+@@ -243,12 +243,6 @@ read_jconf(const char *file)
+                 }
+             } else if (strcmp(name, "server_port") == 0) {
+                 conf.remote_port = to_string(value);
+-            } else if (strcmp(name, "local_address") == 0) {
+-                conf.local_addr = to_string(value);
+-            } else if (strcmp(name, "local_ipv4_address") == 0) {
+-                conf.local_addr_v4 = to_string(value);
+-            } else if (strcmp(name, "local_ipv6_address") == 0) {
+-                conf.local_addr_v6 = to_string(value);
+             } else if (strcmp(name, "local_port") == 0) {
+                 conf.local_port = to_string(value);
+             } else if (strcmp(name, "password") == 0) {
+diff --git a/src/jconf.h b/src/jconf.h
+index a953033..e73f770 100644
+--- a/src/jconf.h
++++ b/src/jconf.h
+@@ -59,9 +59,6 @@ typedef struct {
+     int port_password_num;
+     ss_port_password_t port_password[MAX_PORT_NUM];
+     char *remote_port;
+-    char *local_addr;
+-    char *local_addr_v4;
+-    char *local_addr_v6;
+     char *local_port;
+     char *password;
+     char *key;
+diff --git a/src/netutils.c b/src/netutils.c
+index af41624..e26a740 100644
+--- a/src/netutils.c
++++ b/src/netutils.c
+@@ -84,34 +84,6 @@ setinterface(int socket_fd, const char *interface_name)
+ 
+ #endif
+ 
+-int
+-parse_local_addr(struct sockaddr_storage *storage_v4,
+-                 struct sockaddr_storage *storage_v6,
+-                 const char *host)
+-{
+-    if (host != NULL) {
+-        struct cork_ip ip;
+-        if (cork_ip_init(&ip, host) != -1) {
+-            if (ip.version == 4) {
+-                memset(storage_v4, 0, sizeof(struct sockaddr_storage));
+-                struct sockaddr_in *addr = (struct sockaddr_in *)storage_v4;
+-                inet_pton(AF_INET, host, &addr->sin_addr);
+-                addr->sin_family = AF_INET;
+-                LOGI("binding to outbound IPv4 addr: %s", host);
+-                return AF_INET;
+-            } else if (ip.version == 6) {
+-                memset(storage_v6, 0, sizeof(struct sockaddr_storage));
+-                struct sockaddr_in6 *addr = (struct sockaddr_in6 *)storage_v6;
+-                inet_pton(AF_INET6, host, &addr->sin6_addr);
+-                addr->sin6_family = AF_INET6;
+-                LOGI("binding to outbound IPv6 addr: %s", host);
+-                return AF_INET6;
+-            }
+-        }
+-    }
+-    return 0;
+-}
+-
+ int
+ bind_to_addr(struct sockaddr_storage *storage,
+              int socket_fd)
+@@ -356,6 +328,47 @@ get_sockaddr(char *host, char *port,
+     return -1;
+ }
+ 
++char *
++get_addr_str(const struct sockaddr *sa, bool has_port)
++{
++    static char s[SS_ADDRSTRLEN];
++    memset(s, 0, SS_ADDRSTRLEN);
++    char addr[INET6_ADDRSTRLEN] = { 0 };
++    char port[PORTSTRLEN]       = { 0 };
++    uint16_t p;
++    struct sockaddr_in sa_in;
++    struct sockaddr_in6 sa_in6;
++
++    if (sa == NULL) {
++        strncpy(s, "null", SS_ADDRSTRLEN - 1);
++        return s;
++    }
++
++    switch (sa->sa_family) {
++    case AF_INET:
++        memcpy(&sa_in, sa, sizeof(struct sockaddr_in));
++        inet_ntop(AF_INET, &sa_in.sin_addr, addr, INET_ADDRSTRLEN);
++        p = ntohs(sa_in.sin_port);
++        sprintf(port, "%d", p);
++        break;
++
++    case AF_INET6:
++        memcpy(&sa_in6, sa, sizeof(struct sockaddr_in6));
++        inet_ntop(AF_INET6, &sa_in6.sin6_addr, addr, INET6_ADDRSTRLEN);
++        p = ntohs(sa_in6.sin6_port);
++        sprintf(port, "%d", p);
++        break;
++
++    default:
++        strncpy(s, "Unknown AF", SS_ADDRSTRLEN - 1);
++        return s;
++    }
++
++    snprintf(s, SS_ADDRSTRLEN, has_port ? "%s:%s" : "%s", addr, port);
++
++    return s;
++}
++
+ int
+ sockaddr_cmp(struct sockaddr_storage *addr1,
+              struct sockaddr_storage *addr2, socklen_t len)
+diff --git a/src/netutils.h b/src/netutils.h
+index cbde4c0..6ca7f75 100644
+--- a/src/netutils.h
++++ b/src/netutils.h
+@@ -27,6 +27,7 @@
+ #include "winsock.h"
+ #else
+ #include <sys/socket.h>
++#include <stdbool.h>
+ #endif
+ 
+ #if defined(HAVE_LINUX_TCP_H)
+@@ -85,15 +86,12 @@ int construct_udprelay_header(const struct sockaddr_storage *in_addr,
+                               char *addr_header);
+ int parse_udprelay_header(const char *buf, const size_t buf_len,
+                           char *host, char *port, struct sockaddr_storage *storage);
++char *get_addr_str(const struct sockaddr *sa, bool has_port);
+ 
+ #ifdef SET_INTERFACE
+ int setinterface(int socket_fd, const char *interface_name);
+ #endif
+ 
+-int parse_local_addr(struct sockaddr_storage *storage_v4,
+-                     struct sockaddr_storage *storage_v6,
+-                     const char *host);
+-
+ int bind_to_addr(struct sockaddr_storage *storage, int socket_fd);
+ 
+ /**
+diff --git a/src/redir.c b/src/redir.c
+index 1ff235b..8b7c587 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -139,17 +139,16 @@ getdestaddr(int fd, struct sockaddr_storage *destaddr)
+ }
+ 
+ int
+-create_and_bind(const char *addr, const char *port)
++create_and_bind(EV_P_ const char *addr, const char *port, listen_ctx_t *listener)
+ {
+     struct addrinfo hints;
+     struct addrinfo *result, *rp;
+-    int s, listen_sock;
++    int s, listen_sock, n = 0;
+ 
+     memset(&hints, 0, sizeof(struct addrinfo));
+     hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
+     hints.ai_socktype = SOCK_STREAM; /* We want a TCP socket */
+-
+-    result = NULL;
++    hints.ai_flags    = AI_PASSIVE | AI_ADDRCONFIG;
+ 
+     s = getaddrinfo(addr, port, &hints, &result);
+     if (s != 0) {
+@@ -168,6 +167,11 @@ create_and_bind(const char *addr, const char *port)
+             continue;
+         }
+ 
++        if (rp->ai_family == AF_INET6) {
++            int ipv6only = 1;
++            setsockopt(listen_sock, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only, sizeof(ipv6only));
++        }
++
+         int opt = 1;
+         setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+ #ifdef SO_NOSIGPIPE
+@@ -199,19 +203,27 @@ create_and_bind(const char *addr, const char *port)
+ 
+         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
+         if (s == 0) {
+-            /* We managed to bind successfully! */
+-            break;
++            if (listen(listen_sock, SOMAXCONN) == -1) {
++                ERROR("listen() error");
++                close(listen_sock);
++                continue;
++            }
++            setnonblocking(listen_sock);
++
++            ev_io *listen_io = ss_malloc(sizeof(ev_io));
++            listen_io->data = listener;
++            ev_io_init(listen_io, accept_cb, listen_sock, EV_READ);
++            ev_io_start(EV_A_ listen_io);
++            n++;
+         } else {
+             ERROR("bind");
++            close(listen_sock);
+         }
+-
+-        close(listen_sock);
+-        listen_sock = -1;
+     }
+ 
+     freeaddrinfo(result);
+ 
+-    return listen_sock;
++    return (n > 0) ? 0 : -1;
+ }
+ 
+ static void
+@@ -888,13 +900,13 @@ start_connect_remote(EV_P_ server_t *server)
+ static void
+ accept_cb(EV_P_ ev_io *w, int revents)
+ {
+-    listen_ctx_t *listener = (listen_ctx_t *)w;
++    listen_ctx_t *listener = (listen_ctx_t *)w->data;
+     struct sockaddr_storage destaddr;
+     memset(&destaddr, 0, sizeof(struct sockaddr_storage));
+ 
+     int err;
+ 
+-    int serverfd = accept(listener->fd, NULL, NULL);
++    int serverfd = accept(w->fd, NULL, NULL);
+     if (serverfd == -1) {
+         ERROR("[tcp] accept");
+         return;
+@@ -975,15 +987,14 @@ main(int argc, char **argv)
+     int pid_flags    = 0;
+     int mptcp        = 0;
+     int mtu          = 0;
+-    char *user       = NULL;
+     char *local_port = NULL;
+-    char *local_addr = NULL;
+     char *password   = NULL;
+     char *key        = NULL;
+     char *timeout    = NULL;
+     char *method     = NULL;
+     char *pid_path   = NULL;
+     char *conf_path  = NULL;
++    char *user       = NULL;
+ 
+     char *plugin      = NULL;
+     char *plugin_opts = NULL;
+@@ -1031,7 +1042,7 @@ main(int argc, char **argv)
+ 
+     USE_TTY();
+ 
+-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUTv6AB:P:",
++    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:a:n:huUTv6A:",
+                             long_options, NULL)) != -1) {
+         switch (c) {
+         case GETOPT_VAL_FAST_OPEN:
+@@ -1076,13 +1087,12 @@ main(int argc, char **argv)
+             break;
+         case GETOPT_VAL_PROBE_DOMAIN:
+             probe_domain = optarg;
++        case GETOPT_VAL_REUSE_PORT:
++            reuse_port = 1;
+             break;
+         case GETOPT_VAL_METRICS_PORT:
+             metrics_port = atoi(optarg);
+             break;
+-        case GETOPT_VAL_REUSE_PORT:
+-            reuse_port = 1;
+-            break;
+         case 's':
+             if (remote_num < MAX_REMOTE_NUM) {
+                 parse_addr(optarg, &remote_addr[remote_num++]);
+@@ -1111,9 +1121,6 @@ main(int argc, char **argv)
+         case 'c':
+             conf_path = optarg;
+             break;
+-        case 'b':
+-            local_addr = optarg;
+-            break;
+         case 'a':
+             user = optarg;
+             break;
+@@ -1173,12 +1180,6 @@ main(int argc, char **argv)
+         if (remote_port == NULL) {
+             remote_port = conf->remote_port;
+         }
+-        if (local_addr == NULL) {
+-            local_addr = conf->local_addr;
+-        }
+-        if (local_port == NULL) {
+-            local_port = conf->local_port;
+-        }
+         if (password == NULL) {
+             password = conf->password;
+         }
+@@ -1191,6 +1192,9 @@ main(int argc, char **argv)
+         if (timeout == NULL) {
+             timeout = conf->timeout;
+         }
++        if (local_port == NULL) {
++            local_port = conf->local_port;
++        }
+         if (user == NULL) {
+             user = conf->user;
+         }
+@@ -1298,14 +1302,6 @@ main(int argc, char **argv)
+     }
+ #endif
+ 
+-    if (local_addr == NULL) {
+-        if (is_ipv6only(remote_addr, remote_num, ipv6first)) {
+-            local_addr = "::1";
+-        } else {
+-            local_addr = "127.0.0.1";
+-        }
+-    }
+-
+     if (fast_open == 1) {
+ #ifdef TCP_FASTOPEN
+         LOGI("using tcp fast open");
+@@ -1389,13 +1385,12 @@ main(int argc, char **argv)
+ 
+     /* Setup proxy context */
+     struct listen_ctx listen_ctx;
+-    memset(&listen_ctx, 0, sizeof(struct listen_ctx));
+     listen_ctx.remote_num  = remote_num;
+     listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
+     memset(listen_ctx.remote_addr, 0, sizeof(struct sockaddr *) * remote_num);
+     listen_ctx.remote_status = ss_malloc(sizeof(bool) * remote_num);
+ 
+-    for (i = 0; i < remote_num; i++) {
++    for (i = 0; i < listen_ctx.remote_num; i++) {
+         listen_ctx.remote_status[i] = true; /* Assume all are up initially */
+         char *host = remote_addr[i].host;
+         char *port = remote_addr[i].port == NULL ? remote_port :
+@@ -1423,7 +1418,7 @@ main(int argc, char **argv)
+      * `remote_status` array that the TCP module will share.
+      */
+     if (mode != TCP_ONLY) {
+-        init_udprelay(local_addr, local_port, listen_ctx.remote_num,
++        init_udprelay(NULL, local_port, listen_ctx.remote_num,
+                       listen_ctx.remote_addr, mtu, crypto,
+                       listen_ctx.timeout, NULL, fwmark, listen_ctx.remote_status);
+     }
+@@ -1433,38 +1428,39 @@ main(int argc, char **argv)
+      * array, which is either managed by the UDP prober or statically set to true.
+      */
+     if (mode != UDP_ONLY) {
+-        listen_ctx_t *listen_ctx_current = &listen_ctx;
++        listen_ctx_t *listen_ctx_current = &listen_ctx; /* The first one is on stack */
++        listen_ctx.tos = 0; /* Default TOS for the primary listener */
+         do {
+             if (listen_ctx_current->tos) {
+-                LOGI("listening at %s:%s (TOS 0x%x)", local_addr, local_port, listen_ctx_current->tos);
++                LOGI("listening at :%s (TOS 0x%x)", local_port, listen_ctx_current->tos);
+             } else {
+-                LOGI("listening at %s:%s", local_addr, local_port);
++                LOGI("listening at :%s", local_port);
+             }
+ 
+-            int listenfd = create_and_bind(local_addr, local_port);
+-            if (listenfd == -1) FATAL("bind() error");
+-            if (listen(listenfd, SOMAXCONN) == -1) FATAL("listen() error");
+-            setnonblocking(listenfd);
+-
+-            listen_ctx_current->fd = listenfd;
+-            ev_io_init(&listen_ctx_current->io, accept_cb, listenfd, EV_READ);
+-            ev_io_start(loop, &listen_ctx_current->io);
+-
+             if (listen_ctx_count < MAX_LISTEN_CTX) {
+                 listen_ctx_list[listen_ctx_count++] = listen_ctx_current;
+             } else {
+                 LOGE("too many listen ctx; increase MAX_LISTEN_CTX");
+             }
+ 
+-            /* Handle additional TOS/DSCP listening ports */
+             if (dscp_num > 0) {
+-                listen_ctx_t *new_lc = (listen_ctx_t *)ss_malloc(sizeof(listen_ctx_t));
+-                memcpy(new_lc, &listen_ctx, sizeof(listen_ctx_t));
++                /* Create a new context for the next DSCP value */
++                listen_ctx_t *new_lc = ss_malloc(sizeof(listen_ctx_t));
++                memcpy(new_lc, &listen_ctx, sizeof(listen_ctx_t)); /* Copy base settings */
+                 local_port = dscp[dscp_num - 1].port;
+-                new_lc->tos = dscp[dscp_num - 1].dscp << 2;
++                new_lc->tos = dscp[dscp_num - 1].dscp << 2; /* Set specific TOS */
+                 listen_ctx_current = new_lc;
++            } else {
++                listen_ctx_current = NULL; // Stop the loop
++            }
++        } while (dscp_num-- > 0 && listen_ctx_current != NULL);
++
++        /* Now, create sockets for all configured listeners */
++        for (i = 0; i < listen_ctx_count; i++) {
++            if (create_and_bind(EV_A_ NULL, local_port, listen_ctx_list[i]) == -1) {
++                FATAL("bind() error");
+             }
+-        } while (dscp_num-- > 0);
++        }
+     } else {
+         LOGI("TCP relay disabled");
+     }
+diff --git a/src/redir.h b/src/redir.h
+index 3c134b6..23e5ec7 100644
+--- a/src/redir.h
++++ b/src/redir.h
+@@ -32,10 +32,8 @@
+ #include "jconf.h"
+ 
+ typedef struct listen_ctx {
+-    ev_io io;
+     int remote_num;
+     int timeout;
+-    int fd;
+     int mptcp;
+     int tos;
+     volatile bool *remote_status;
+@@ -78,7 +76,6 @@ typedef struct remote {
+     remote_ctx_t *recv_ctx;
+     remote_ctx_t *send_ctx;
+     struct server *server;
+-    uint32_t counter;
+     struct sockaddr *addr;
+ } remote_t;
+ 
+diff --git a/src/shadowsocks.h b/src/shadowsocks.h
+index 6c36611..c72e05c 100644
+--- a/src/shadowsocks.h
++++ b/src/shadowsocks.h
+@@ -25,7 +25,6 @@
+ typedef struct {
+     /*  Required  */
+     char *remote_host;    // hostname or ip of remote server
+-    char *local_addr;     // local ip to bind
+     char *method;         // encryption method
+     char *password;       // password of remote server
+     int remote_port;      // port number of remote server
+@@ -46,7 +45,6 @@ typedef struct {
+  *
+  * const profile_t EXAMPLE_PROFILE = {
+  *  .remote_host = "example.com",
+- *  .local_addr = "127.0.0.1",
+  *  .method = "bf-cfb",
+  *  .password = "barfoo!",
+  *  .remote_port = 8338,
+diff --git a/src/udprelay.c b/src/udprelay.c
+index eff2dbc..49d8559 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -124,48 +124,6 @@ hash_key_fill(char *out_key, const int af, const struct sockaddr_storage *addr)
+     memcpy(out_key + sizeof(int), (const uint8_t *)addr, sizeof(struct sockaddr_storage));
+ }
+ 
+-static char *
+-get_addr_str(const struct sockaddr *sa, bool has_port)
+-{
+-    static char s[SS_ADDRSTRLEN];
+-    memset(s, 0, SS_ADDRSTRLEN);
+-    char addr[INET6_ADDRSTRLEN] = { 0 };
+-    char port[PORTSTRLEN]       = { 0 };
+-    uint16_t p;
+-    struct sockaddr_in sa_in;
+-    struct sockaddr_in6 sa_in6;
+-
+-    switch (sa->sa_family) {
+-    case AF_INET:
+-        memcpy(&sa_in, sa, sizeof(struct sockaddr_in));
+-        inet_ntop(AF_INET, &sa_in.sin_addr, addr, INET_ADDRSTRLEN);
+-        p = ntohs(sa_in.sin_port);
+-        sprintf(port, "%d", p);
+-        break;
+-
+-    case AF_INET6:
+-        memcpy(&sa_in6, sa, sizeof(struct sockaddr_in6));
+-        inet_ntop(AF_INET6, &sa_in6.sin6_addr, addr, INET6_ADDRSTRLEN);
+-        p = ntohs(sa_in6.sin6_port);
+-        sprintf(port, "%d", p);
+-        break;
+-
+-    default:
+-        strncpy(s, "Unknown AF", SS_ADDRSTRLEN);
+-    }
+-
+-    int addr_len = strlen(addr);
+-    int port_len = strlen(port);
+-    memcpy(s, addr, addr_len);
+-
+-    if (has_port) {
+-        memcpy(s + addr_len + 1, port, port_len);
+-        s[addr_len] = ':';
+-    }
+-
+-    return s;
+-}
+-
+ int
+ create_remote_socket(int ipv6)
+ {
+@@ -291,22 +249,28 @@ create_server_socket(const char *host, const char *port)
+         }
+ #endif
+ 
+-        int sol    = rp->ai_family == AF_INET ? SOL_IP : SOL_IPV6;
+-        int flag_t = rp->ai_family == AF_INET ? IP_TRANSPARENT : IPV6_TRANSPARENT;
+-        int flag_r = rp->ai_family == AF_INET ? IP_RECVORIGDSTADDR : IPV6_RECVORIGDSTADDR;
+-
+-        if (setsockopt(server_sock, sol, flag_t, &opt, sizeof(opt))) {
+-            ERROR("[udp] setsockopt IP_TRANSPARENT failed");
+-            close(server_sock);
+-            server_sock = -1;
+-            continue;
+-        }
+-
+-        if (setsockopt(server_sock, sol, flag_r, &opt, sizeof(opt))) {
+-            ERROR("[udp] setsockopt IP_RECVORIGDSTADDR failed");
+-            close(server_sock);
+-            server_sock = -1;
+-            continue;
++        if (rp->ai_family == AF_INET) {
++            if (setsockopt(server_sock, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) ||
++                setsockopt(server_sock, SOL_IP, IP_RECVORIGDSTADDR, &opt, sizeof(opt))) {
++                ERROR("[udp] setsockopt for IPv4 TPROXY failed");
++                close(server_sock);
++                server_sock = -1;
++                continue;
++            }
++        } else { // AF_INET6
++            if (setsockopt(server_sock, SOL_IPV6, IPV6_TRANSPARENT, &opt, sizeof(opt)) ||
++                setsockopt(server_sock, SOL_IPV6, IPV6_RECVORIGDSTADDR, &opt, sizeof(opt))) {
++                ERROR("[udp] setsockopt for IPv6 TPROXY failed");
++                close(server_sock);
++                server_sock = -1;
++                continue;
++            }
++            /* For dual-stack sockets, we must set the IPv4 options as well */
++            if (setsockopt(server_sock, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) ||
++                setsockopt(server_sock, SOL_IP, IP_RECVORIGDSTADDR, &opt, sizeof(opt))) {
++                /* This is not a fatal error, as it might fail on IPv6-only systems */
++                LOGI("[udp] could not set IPv4 TPROXY options on IPv6 socket (this is expected on IPv6-only systems)");
++            }
+         }
+ 
+         s = bind(server_sock, rp->ai_addr, rp->ai_addrlen);
+@@ -475,24 +439,51 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
+         LOGI("[udp] remote_sendto fragmentation MTU maybe: " SSIZE_FMT, buf->len + PACKET_HEADER_SIZE);
+     }
+ 
+-    /* Create a new socket for each reply to correctly spoof source address */
+-    int reply_fd = socket(dst_addr.ss_family, SOCK_DGRAM, 0);
++    /*
++     * To handle mixed IPv4/IPv6 scenarios (e.g., IPv4 client to IPv6 dest),
++     * we consistently create an IPv6 socket for replies. If the spoofed source
++     * (`dst_addr`) is IPv4, we convert it to an IPv4-mapped IPv6 address for binding.
++     * This dual-stack socket can then send to both IPv4 and IPv6 clients.
++     */
++    int reply_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+     if (reply_fd == -1) {
+         ERROR("[udp] failed to create reply socket");
+         goto CLEAN_UP;
+     }
+ 
+-    int opt = 1;
+-    int sol = (dst_addr.ss_family == AF_INET) ? SOL_IP : SOL_IPV6;
+-    int flag_t = (dst_addr.ss_family == AF_INET) ? IP_TRANSPARENT : IPV6_TRANSPARENT;
++    /* Allow this socket to handle both IPv4 and IPv6 */
++    int ipv6only = 0;
++    setsockopt(reply_fd, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only, sizeof(ipv6only));
+ 
+-    if (setsockopt(reply_fd, sol, flag_t, &opt, sizeof(opt)) != 0) {
++    int opt = 1;
++    /* We need both IPv6 and IPv4 transparent options for the dual-stack socket */
++    if (setsockopt(reply_fd, SOL_IPV6, IPV6_TRANSPARENT, &opt, sizeof(opt)) != 0 ||
++        setsockopt(reply_fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) != 0) {
+         ERROR("[udp] failed to set IP_TRANSPARENT on reply socket");
+         close(reply_fd);
+         goto CLEAN_UP;
+     }
+ 
+-    if (bind(reply_fd, (struct sockaddr *)&dst_addr, get_sockaddr_len((struct sockaddr *)&dst_addr)) != 0) {
++    struct sockaddr_storage bind_addr;
++    socklen_t bind_addr_len;
++
++    /* Convert original destination to IPv4-mapped IPv6 if necessary for binding */
++    if (dst_addr.ss_family == AF_INET) {
++        struct sockaddr_in *v4_addr = (struct sockaddr_in *)&dst_addr;
++        struct sockaddr_in6 v6_mapped_addr = {0};
++        v6_mapped_addr.sin6_family = AF_INET6;
++        v6_mapped_addr.sin6_port = v4_addr->sin_port;
++        v6_mapped_addr.sin6_addr.s6_addr[10] = 0xff;
++        v6_mapped_addr.sin6_addr.s6_addr[11] = 0xff;
++        memcpy(&v6_mapped_addr.sin6_addr.s6_addr[12], &v4_addr->sin_addr, sizeof(struct in_addr));
++        memcpy(&bind_addr, &v6_mapped_addr, sizeof(v6_mapped_addr));
++        bind_addr_len = sizeof(v6_mapped_addr);
++    } else {
++        memcpy(&bind_addr, &dst_addr, sizeof(dst_addr));
++        bind_addr_len = sizeof(struct sockaddr_in6);
++    }
++
++    if (bind(reply_fd, (struct sockaddr *)&bind_addr, bind_addr_len) != 0) {
+         ERROR("[udp] failed to bind reply socket to spoofed source");
+         close(reply_fd);
+         goto CLEAN_UP;
+@@ -570,8 +561,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
+     for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL; cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+         if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVORIGDSTADDR) {
+             memcpy(&dst_addr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in));
++            dst_addr.ss_family = AF_INET;
+         } else if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_RECVORIGDSTADDR) {
+             memcpy(&dst_addr, CMSG_DATA(cmsg), sizeof(struct sockaddr_in6));
++            dst_addr.ss_family = AF_INET6;
+         }
+     }
+ 
+@@ -802,9 +795,6 @@ free_udprelay()
+     while (server_num > 0) {
+         server_ctx_t *server_ctx = server_ctx_list[--server_num];
+         ev_io_stop(loop, &server_ctx->io);
+-        /* Use a temporary variable to hold the pointer for ss_free */
+-        void *status_ptr = (void *)server_ctx->remote_status;
+-        ss_free(status_ptr);
+         close(server_ctx->fd);
+         cache_delete(server_ctx->conn_cache, 0);
+         ss_free(server_ctx);
+diff --git a/src/utils.c b/src/utils.c
+index 31ce727..923a775 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -278,7 +278,7 @@ ss_realloc(void *ptr, size_t new_size)
+ int
+ ss_is_ipv6addr(const char *addr)
+ {
+-    return strcmp(addr, ":") > 0;
++    return strchr(addr, ':') != NULL;
+ }
+ 
+ void
+@@ -334,8 +334,6 @@ usage()
+     printf(
+         "       [-n <number>]              Max number of open files.\n");
+ #endif
+-    printf(
+-        "       [-b <local_address>]       Local address to bind.\n");
+     printf("\n");
+     printf(
+         "       [-u]                       Enable UDP relay.\n");
+-- 
+2.37.1 (Apple Git-137.1)
+

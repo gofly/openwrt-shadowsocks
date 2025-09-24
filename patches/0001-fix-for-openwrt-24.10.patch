@@ -1,20 +1,35 @@
-From 4ab37717533ca8001d9da3716ea730c2960d0c47 Mon Sep 17 00:00:00 2001
+From 54a9e6e71fbd243aefd311483e28a1d7a827df37 Mon Sep 17 00:00:00 2001
 From: zhenglixin <lixin.zhenglx@gmail.com>
 Date: Sun, 21 Sep 2025 14:30:27 +0800
-Subject: [PATCH 1/9] fix for openwrt 24.10
+Subject: [PATCH 1/8] fix for openwrt 24.10
 
 ---
- configure.ac  |  6 ------
- m4/mbedtls.m4 | 20 ++++++++++++++++++++
- src/aead.c    | 23 +++++++++++------------
- src/crypto.c  |  2 +-
- src/stream.c  | 51 ++++++---------------------------------------------
- 5 files changed, 38 insertions(+), 64 deletions(-)
+ configure.ac   | 49 +++++++++++++++++++++++++++++++++++++-----------
+ m4/mbedtls.m4  | 20 ++++++++++++++++++++
+ src/aead.c     | 23 +++++++++++------------
+ src/crypto.c   |  2 +-
+ src/stream.c   | 51 ++++++--------------------------------------------
+ src/udprelay.c |  1 -
+ 6 files changed, 76 insertions(+), 70 deletions(-)
+ mode change 100755 => 100644 configure.ac
 
 diff --git a/configure.ac b/configure.ac
-index 9787bc2..2d1d01a 100755
+old mode 100755
+new mode 100644
+index 9787bc2..c0de4af
 --- a/configure.ac
 +++ b/configure.ac
+@@ -1,8 +1,8 @@
+ dnl                                               -*- Autoconf -*-
+ dnl Process this file with autoconf to produce a configure script.
+ 
+-AC_PREREQ([2.67])
+-AC_INIT([shadowsocks-libev], [3.3.5], [max.c.lv@gmail.com])
++AC_PREREQ([2.71])
++AC_INIT([shadowsocks-libev],[3.3.5],[max.c.lv@gmail.com])
+ AC_CONFIG_SRCDIR([src/crypto.c])
+ AC_CONFIG_HEADERS([config.h])
+ AC_CONFIG_AUX_DIR(auto)
 @@ -102,11 +102,6 @@ case $host in
      ;;
  esac
@@ -27,7 +42,64 @@ index 9787bc2..2d1d01a 100755
  dnl Checks for stack protector
  GGL_CHECK_STACK_PROTECTOR([has_stack_protector=yes], [has_stack_protector=no])
  # XXX - disable -fstack-protector due to missing libssp_nonshared
-@@ -234,7 +229,6 @@ AC_ARG_WITH(ev,
+@@ -204,7 +199,15 @@ AC_TYPE_SSIZE_T
+ 
+ dnl Checks for header files.
+ AC_HEADER_ASSERT
+-AC_HEADER_STDC
++m4_warn([obsolete],
++[The preprocessor macro `STDC_HEADERS' is obsolete.
++  Except in unusual embedded environments, you can safely include all
++  ISO C90 headers unconditionally.])dnl
++# Autoupdate added the next two lines to ensure that your configure
++# script's behavior did not change.  They are probably safe to remove.
++AC_CHECK_INCLUDES_DEFAULT
++AC_PROG_EGREP
++
+ AC_HEADER_SYS_WAIT
+ 
+ dnl Checks for typedefs, structures, and compiler characteristics.
+@@ -214,12 +217,37 @@ AC_TYPE_SIZE_T
+ AC_TYPE_SSIZE_T
+ AC_TYPE_UINT16_T
+ AC_TYPE_UINT8_T
+-AC_HEADER_TIME
++m4_warn([obsolete],
++[Update your code to rely only on HAVE_SYS_TIME_H,
++then remove this warning and the obsolete code below it.
++All current systems provide time.h; it need not be checked for.
++Not all systems provide sys/time.h, but those that do, all allow
++you to include it and time.h simultaneously.])dnl
++AC_CHECK_HEADERS_ONCE([sys/time.h])
++# Obsolete code to be removed.
++if test $ac_cv_header_sys_time_h = yes; then
++  AC_DEFINE([TIME_WITH_SYS_TIME],[1],[Define to 1 if you can safely include both <sys/time.h>
++	     and <time.h>.  This macro is obsolete.])
++fi
++# End of obsolete code.
++
+ 
+ dnl Checks for library functions.
+ AC_FUNC_FORK
+ AC_FUNC_SELECT_ARGTYPES
+-AC_TYPE_SIGNAL
++m4_warn([obsolete],
++[your code may safely assume C89 semantics that RETSIGTYPE is void.
++Remove this warning and the `AC_CACHE_CHECK' when you adjust the code.])dnl
++AC_CACHE_CHECK([return type of signal handlers],[ac_cv_type_signal],[AC_COMPILE_IFELSE(
++[AC_LANG_PROGRAM([#include <sys/types.h>
++#include <signal.h>
++],
++		 [return *(signal (0, 0)) (0) == 1;])],
++		   [ac_cv_type_signal=int],
++		   [ac_cv_type_signal=void])])
++AC_DEFINE_UNQUOTED([RETSIGTYPE],[$ac_cv_type_signal],[Define as the return type of signal handlers
++		    (`int' or `void').])
++
+ AC_CHECK_FUNCS([memset select setresuid setreuid strerror get_current_dir_name getpwnam_r setrlimit])
+ 
+ AC_CHECK_LIB(socket, connect)
+@@ -234,7 +262,6 @@ AC_ARG_WITH(ev,
     LDFLAGS="$LDFLAGS -L$withval/lib"]
  )
  AC_CHECK_HEADERS([ev.h libev/ev.h], [], [])
@@ -235,6 +307,18 @@ index 35d9050..b2e2cea 100644
      cipher->method = method;
  
      return cipher;
+diff --git a/src/udprelay.c b/src/udprelay.c
+index 0ebef4f..5aa46b7 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -1378,7 +1378,6 @@ void
+ free_cb(void *key, void *element)
+ {
+     remote_ctx_t *remote_ctx = (remote_ctx_t *)element;
+-
+     if (verbose) {
+         LOGI("[udp] one connection freed");
+     }
 -- 
 2.37.1 (Apple Git-137.1)
 
