@@ -12,7 +12,7 @@ define Package/shadowsocks-rules
 	CATEGORY:=Network
 	TITLE:=Lightweight Secured Socks5 Proxy
 	URL:=https://github.com/gofly/openwrt-shadowsocks
-	DEPENDS:=+kmod-nft-socket +kmod-nft-tproxy
+	DEPENDS:=+kmod-nft-socket +kmod-nft-tproxy +shadowsocks-libev
 endef
 
 define Package/shadowsocks-rules/description

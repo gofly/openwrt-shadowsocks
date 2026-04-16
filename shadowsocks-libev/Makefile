@@ -4,10 +4,6 @@ PKG_NAME:=shadowsocks-libev
 PKG_VERSION:=3.3.6
 PKG_RELEASE:=1
 
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/shadowsocks/shadowsocks-libev.git
-PKG_SOURCE_VERSION:=9afa3cacf947f910be46b69fc5a7a1fdd02fd5e6
-
 PKG_SOURCE_SUBDIR:=shadowsocks-libev
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_SOURCE_SUBDIR)
 
